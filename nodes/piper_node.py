@@ -64,6 +64,7 @@ from config import (
     MOTION_START_MIN_DELTA_RAD,
     CALIBRATION_MIN_SPAN_RAD,
     CALIBRATION_LIMIT_TOLERANCE_RAD,
+    REARM_HOLD_LIMIT_TOLERANCE_RAD,
     PIPER_HARDWARE_JOINT_LIMITS,
 )
 
@@ -352,6 +353,24 @@ class PiperTeachReplayNode(Node):
         if len(hardware) == DOF:
             return hardware
         return list(PIPER_HARDWARE_JOINT_LIMITS)
+
+    @staticmethod
+    def _snap_within_tolerance(values: list[float], limits: list[tuple], tolerance: float) -> list[float]:
+        """Nudge values that are outside `limits` by no more than `tolerance` onto the
+        nearest boundary; larger excursions are left untouched so the caller's own
+        limit check still rejects them. Used only to re-arm at the CURRENT measured
+        pose (already physically valid by definition — see REARM_HOLD_LIMIT_TOLERANCE_RAD),
+        never to validate a newly commanded target."""
+        snapped = list(values)
+        for i, (lo, hi) in enumerate(limits):
+            if i >= len(snapped):
+                break
+            v = snapped[i]
+            if v < lo and lo - v <= tolerance:
+                snapped[i] = lo
+            elif v > hi and v - hi <= tolerance:
+                snapped[i] = hi
+        return snapped
 
     def _enter_safety_lock(self, reason: str, details: Optional[dict] = None):
         first = not self._safety_latched
@@ -2093,6 +2112,14 @@ class PiperTeachReplayNode(Node):
 
         with self._lock:
             current = list(self._latest_position[:DOF])
+        # With motors disabled, gravity can sag J2/J3 a fraction of a radian past
+        # their hard-stop boundary — a normal resting state, not a fault. Holding
+        # the current pose to re-arm must not be rejected for that; snap only a
+        # small, tolerance-bounded excursion onto the boundary. A real commanded
+        # target still goes through _publish_joint_cmd's unmodified check below.
+        limits = self._replay_joint_limits() if hardware_limits_only else self._effective_joint_limits()
+        if limits:
+            current = self._snap_within_tolerance(current, limits, REARM_HOLD_LIMIT_TOLERANCE_RAD)
         for _ in range(15):
             if not self._publish_joint_cmd(
                 current, velocity=5.0,

@@ -49,6 +49,14 @@ CALIBRATION_MIN_SPAN_RAD = 0.25
 # swept calibration extremum.  Permit about 3 degrees around calibration-only
 # bounds, while the SDK hardware bounds remain absolute.
 CALIBRATION_LIMIT_TOLERANCE_RAD = 0.05
+# With motors disabled, gravity sags J2/J3 a small amount past their hard-stop
+# boundary (this is normal, not a fault) — the resting pose can end up a
+# fraction of a radian outside the limits used for a fresh target move.
+# _prepare_joint_motion()'s re-arm step holds the CURRENT measured pose, which
+# by definition is already physically valid, so snap it to the boundary when
+# it's outside by no more than this tolerance instead of rejecting the
+# re-arm.  This never loosens validation for an actual commanded target.
+REARM_HOLD_LIMIT_TOLERANCE_RAD = 0.05
 # Piper URDF/vendor hard stops (rad).  Used for replay preflight until the
 # driver publishes its live SDK motor-limit snapshot.
 PIPER_HARDWARE_JOINT_LIMITS = [
