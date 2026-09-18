@@ -16,6 +16,9 @@ export default function ReviewEpisodeModal({
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
   const [videoTab, setVideoTab] = useState("color");
+  const [partialReplay, setPartialReplay] = useState(false);
+  const [partialReason, setPartialReason] = useState("");
+  const [abortClass, setAbortClass] = useState("");
   const [cameraVideos, setCameraVideos] = useState<Array<{ id: string; label: string; url: string }>>([]);
 
   const can = (a: string) => availableActions.includes(a);
@@ -23,6 +26,9 @@ export default function ReviewEpisodeModal({
   useEffect(() => {
     setLabel(null);
     setReason("");
+    setPartialReplay(false);
+    setPartialReason("");
+    setAbortClass("");
   }, [episodeId]);
 
   useEffect(() => {
@@ -30,6 +36,10 @@ export default function ReviewEpisodeModal({
     fetch(`/api/episodes/${episodeId}`)
       .then(r => r.json())
       .then(ep => {
+        const replay = ep.recording?.last_replay;
+        setPartialReplay(Boolean(replay?.partial));
+        setPartialReason(String(replay?.reason ?? ""));
+        setAbortClass(String(replay?.abort_class ?? ""));
         const takes: Array<{
           take: string;
           has_video?: boolean;
@@ -127,6 +137,13 @@ export default function ReviewEpisodeModal({
         <button style={styles.closeBtn} onClick={onClose}>×</button>
       </div>
       <div style={styles.body}>
+        {partialReplay && (
+          <div style={styles.partialNotice}>
+            {abortClass
+              ? `Replay stopped safely (${abortClass}): ${partialReason || "motion aborted"}. This take is excluded from the default LeRobot export.`
+              : "Partial replay — recording was stopped early. The captured portion can still be reviewed and saved."}
+          </div>
+        )}
         <div style={styles.previewColumn}>
           <div style={styles.tabs}>
             {videoTabs.map(({ id, label }) => (
@@ -307,6 +324,16 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1,
   },
   body: { display: "grid", gridTemplateColumns: "1fr 280px", gap: 18 },
+  partialNotice: {
+    gridColumn: "1 / -1",
+    border: "1px solid #fbbf24",
+    borderRadius: 8,
+    background: "#fffbeb",
+    color: "#92400e",
+    padding: "9px 12px",
+    fontSize: 12,
+    fontWeight: 700,
+  },
   previewColumn: { minWidth: 0, display: "flex", flexDirection: "column", gap: 8 },
   tabs: { display: "flex", gap: 4, flexWrap: "wrap" },
   tabBtn: {

@@ -1,15 +1,17 @@
 """
 Piper 데이터셋 → LeRobot v2.0 형식 변환기
 - executed_joint.csv → observation.state, action (7-dim: q1-q6, gripper)
-- webcam_0 / webcam_1 영상 → 224×224 @ 15fps (imageio_ffmpeg 사용)
+- webcam_0 / webcam_1 영상 → OpenCV frame decode/resize → 224×224 @ 15fps
 - 15fps 그리드에 맞게 joint 데이터 선형 보간
 - 트리밍 규칙: 10초 이후 첫 gripper open 전환 감지 후 +1초에서 끊음
 """
 
 import csv
 import json
+import math
 import os
 import subprocess
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -253,47 +255,189 @@ def _encode_video(
     max_duration: float | None = None,
     mask_overlay: str | None = None,
     ss: float = 0.0,
+    time_scale: float = 1.0,
 ):
-    """imageio_ffmpeg bundled binary で src → size×size @ target_fps h264 mp4.
-    ss: 소스 비디오 시작 오프셋(초) — joint t0와 camera t0 차이 보정에 사용.
-    max_duration이 주어지면 ss 이후 그 길이(초)까지만 인코딩.
-    mask_overlay가 주어지면 해당 PNG를 오버레이(mask-out 영역 검정 처리).
+    """Decode source frames, resize them, and encode a clean H.264 MP4.
+
+    The source file is deliberately never passed to ffmpeg. OpenCV turns it into
+    raw pixels first, so rotation tags, camera tags, chapters, audio, and all other
+    source-container metadata cannot leak into the LeRobot export. ffmpeg is used
+    only as a raw-frame H.264 encoder for broad LeRobot/player compatibility.
+
+    ``ss`` is the source start offset in seconds. ``max_duration`` limits the
+    exported *output* duration after that offset. ``time_scale`` changes only the
+    presentation duration: 2.0 emits every decoded source frame for twice as
+    long, preserving the physical replay speed when the preview was normalized
+    to teaching speed. An optional RGBA mask is composited after resizing.
     """
-    ffmpeg = _get_ffmpeg()
-    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    cmd = [ffmpeg, "-y"]
-    if ss > 0.01:
-        cmd += ["-ss", f"{ss:.3f}"]
-    cmd += ["-i", src_path]
-    if mask_overlay:
-        cmd += ["-i", mask_overlay]
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("OpenCV is required for LeRobot video export") from exc
+
+    if target_fps <= 0 or size <= 0:
+        raise ValueError("target_fps and size must be positive")
+    time_scale = float(time_scale)
+    if not math.isfinite(time_scale) or time_scale <= 0:
+        raise ValueError("time_scale must be a positive finite number")
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(src_path)
+
+    cap = cv2.VideoCapture(src_path)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"OpenCV could not open source video: {src_path}")
+
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if not math.isfinite(src_fps) or src_fps <= 0:
+        src_fps = float(target_fps)
+    src_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    start_frame = max(0, int(round(max(0.0, float(ss)) * src_fps)))
+    available_frames = max(0, src_frame_count - start_frame)
+    available_duration = (
+        available_frames / src_fps * time_scale if available_frames else None
+    )
+
+    requested_duration = None
     if max_duration is not None:
-        cmd += ["-t", str(max_duration)]
+        requested_duration = max(0.0, float(max_duration))
+    output_duration = requested_duration
+    if available_duration is not None:
+        output_duration = (
+            available_duration
+            if output_duration is None
+            else min(output_duration, available_duration)
+        )
+    output_frame_count = (
+        max(0, int(math.ceil(output_duration * target_fps - 1e-9)))
+        if output_duration is not None
+        else None
+    )
+
+    overlay_bgra = None
     if mask_overlay:
-        cmd += [
-            "-filter_complex",
-            f"[0:v]fps={target_fps},scale={size}:{size}[v];[1:v]scale={size}:{size}[m];[v][m]overlay=0:0[out]",
-            "-map", "[out]",
-        ]
-    else:
-        cmd += ["-vf", f"fps={target_fps},scale={size}:{size}"]
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23", dst_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-1000:]}")
+        overlay_bgra = cv2.imread(mask_overlay, cv2.IMREAD_UNCHANGED)
+        if overlay_bgra is None:
+            cap.release()
+            raise RuntimeError(f"OpenCV could not open mask overlay: {mask_overlay}")
+        overlay_bgra = cv2.resize(overlay_bgra, (size, size), interpolation=cv2.INTER_AREA)
+        if overlay_bgra.ndim != 3 or overlay_bgra.shape[2] not in (3, 4):
+            cap.release()
+            raise RuntimeError("Mask overlay must be an RGB or RGBA image")
+
+    dst_dir = os.path.dirname(dst_path) or "."
+    os.makedirs(dst_dir, exist_ok=True)
+    tmp_file = tempfile.NamedTemporaryFile(
+        prefix=".lerobot-video-", suffix=".mp4", dir=dst_dir, delete=False
+    )
+    tmp_path = tmp_file.name
+    tmp_file.close()
+
+    ffmpeg = _get_ffmpeg()
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s:v", f"{size}x{size}", "-r", str(target_fps), "-i", "pipe:0",
+        "-an", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-preset", "fast", "-crf", "23", "-movflags", "+faststart",
+        tmp_path,
+    ]
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    encoded_frames = 0
+    current_source_index = start_frame - 1
+    current_frame = None
+
+    try:
+        if start_frame:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        while output_frame_count is None or encoded_frames < output_frame_count:
+            desired_source_index = start_frame + int(
+                round(encoded_frames * src_fps / (target_fps * time_scale))
+            )
+            while current_source_index < desired_source_index:
+                ok, decoded = cap.read()
+                if not ok:
+                    current_frame = None
+                    break
+                current_source_index += 1
+                current_frame = decoded
+            if current_frame is None:
+                break
+
+            interpolation = (
+                cv2.INTER_AREA
+                if current_frame.shape[1] > size or current_frame.shape[0] > size
+                else cv2.INTER_LINEAR
+            )
+            frame = cv2.resize(current_frame, (size, size), interpolation=interpolation)
+
+            if overlay_bgra is not None:
+                if overlay_bgra.shape[2] == 4:
+                    alpha = overlay_bgra[:, :, 3:4].astype(np.float32) / 255.0
+                    frame = np.clip(
+                        frame.astype(np.float32) * (1.0 - alpha)
+                        + overlay_bgra[:, :, :3].astype(np.float32) * alpha,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                else:
+                    frame = overlay_bgra.copy()
+
+            if process.stdin is None:
+                raise RuntimeError("ffmpeg raw-frame input pipe is unavailable")
+            process.stdin.write(np.ascontiguousarray(frame).tobytes())
+            encoded_frames += 1
+
+        if encoded_frames == 0:
+            raise RuntimeError(f"No frames decoded from source video: {src_path}")
+
+        if process.stdin is not None:
+            process.stdin.close()
+            process.stdin = None
+        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+        returncode = process.wait()
+        if returncode != 0:
+            raise RuntimeError(f"ffmpeg raw-frame encode failed:\n{stderr[-1000:]}")
+        os.replace(tmp_path, dst_path)
+    except (BrokenPipeError, OSError) as exc:
+        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+        raise RuntimeError(f"ffmpeg raw-frame encode failed: {exc}\n{stderr[-1000:]}") from exc
+    finally:
+        cap.release()
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.stderr is not None:
+            process.stderr.close()
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def _get_latest_take_dir(ep_dir: str) -> str | None:
-    """에피소드 디렉터리에서 가장 마지막 take 디렉터리 반환."""
+    """Return the newest take containing usable joint data.
+
+    An interrupted retry can leave a newer empty take directory.  Falling back
+    prevents that placeholder from silently removing an otherwise valid episode
+    from an export (the 2026-08-27 batch had exactly one such case).
+    """
     takes_dir = os.path.join(ep_dir, "takes")
     if not os.path.isdir(takes_dir):
         return None
     takes = sorted(
         [d for d in os.listdir(takes_dir) if os.path.isdir(os.path.join(takes_dir, d))]
     )
-    if not takes:
-        return None
-    return os.path.join(takes_dir, takes[-1])
+    for take in reversed(takes):
+        take_dir = os.path.join(takes_dir, take)
+        if any(os.path.isfile(os.path.join(take_dir, name)) for name in ("executed_joint.csv", "teach_joint.csv")):
+            return take_dir
+    return None
 
 
 def _cam_feature_key(cam: dict) -> str:
@@ -307,11 +451,18 @@ def convert_episodes(
     export_preset: str = "default",
     mask_mode: str = "edit",
     mask_fill_color: str = "#000000",
+    preserve_source_indices: bool = False,
+    include_default_excluded: bool = False,
 ) -> None:
     """
     선택된 episode_ids를 LeRobot v2.0 형식으로 out_dir에 변환 저장.
     각 episode의 마지막 take를 LeRobot 에피소드 1개로 매핑.
     """
+    if preserve_source_indices and not include_default_excluded:
+        raise ValueError(
+            "preserve_source_indices requires include_default_excluded so the "
+            "LeRobot index range remains contiguous"
+        )
     os.makedirs(out_dir, exist_ok=True)
     manifest = load_manifest()
     export_cam_list = export_cameras(export_preset, manifest)
@@ -349,31 +500,76 @@ def convert_episodes(
     os.makedirs(data_dir, exist_ok=True)
 
     source_map: list[dict] = []
+    used_episode_indices: set[int] = set()
 
-    for ep_idx, (ep_id, task) in enumerate(zip(episode_ids, ep_tasks)):
+    for _source_ep_idx, (ep_id, task) in enumerate(zip(episode_ids, ep_tasks)):
         ep_dir = os.path.join(dataset_path, ep_id)
         take_dir = _get_latest_take_dir(ep_dir)
         if take_dir is None:
             continue
         take_name = os.path.basename(take_dir)
+        replay_result_path = os.path.join(take_dir, "replay_result.json")
+        replay_result: dict = {}
+        if os.path.isfile(replay_result_path):
+            try:
+                with open(replay_result_path) as file:
+                    replay_result = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                replay_result = {}
+        default_excluded = bool(replay_result.get("export_excluded_default"))
+        if default_excluded and not include_default_excluded and export_preset != "debug":
+            continue
 
-        # replay 비디오는 executed_joint 실제 시간을 speed-adjust한 결과이므로,
-        # parquet trajectory도 executed_joint를 비디오 duration으로 정규화해 생성한다.
-        full_video_duration = _get_take_video_duration(take_dir, export_cam_list)
+        # ── edit_meta 및 timing policy 로드 ──────────────────────────────
+        edit_meta_path = os.path.join(take_dir, "edit_meta.json")
+        edit_meta: dict = {}
+        if os.path.exists(edit_meta_path):
+            try:
+                with open(edit_meta_path) as f:
+                    edit_meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                edit_meta = {}
+
+        timing_cfg = edit_meta.get("timing", {})
+        timing_mode = timing_cfg.get("mode", "teaching_normalized")
+        if timing_mode not in ("teaching_normalized", "physical_replay"):
+            timing_mode = "teaching_normalized"
+
+        source_video_duration = _get_take_video_duration(take_dir, export_cam_list)
         joint_csv = os.path.join(take_dir, "executed_joint.csv")
         if not os.path.exists(joint_csv):
             joint_csv = os.path.join(take_dir, "teach_joint.csv")
 
+        joint_duration = _get_csv_duration(joint_csv)
+        video_time_scale = 1.0
+        full_video_duration = source_video_duration
+        if (
+            timing_mode == "physical_replay"
+            and source_video_duration is not None
+            and source_video_duration > 0
+            and joint_duration is not None
+            and joint_duration > 0
+        ):
+            # Preview MP4 is normally shortened back to teaching speed. Stretch
+            # its decoded pixels to the executed trajectory duration for selected
+            # episodes without reintroducing source-container metadata.
+            full_video_duration = joint_duration
+            video_time_scale = joint_duration / source_video_duration
+
         raw_samples = _resample_joints(joint_csv, output_duration=full_video_duration)
         if not raw_samples:
             continue
-
-        # ── edit_meta 로드 ────────────────────────────────────────────────
-        edit_meta_path = os.path.join(take_dir, "edit_meta.json")
-        edit_meta: dict = {}
-        if os.path.exists(edit_meta_path):
-            with open(edit_meta_path) as f:
-                edit_meta = json.load(f)
+        # Training exports compact excluded inputs. Review exports can include
+        # every input and keep the archive's original episode file/index.
+        original_index_raw = edit_meta.get("export", {}).get("original_episode_index", _source_ep_idx)
+        try:
+            original_ep_idx = int(original_index_raw)
+        except (TypeError, ValueError):
+            original_ep_idx = _source_ep_idx
+        ep_idx = original_ep_idx if preserve_source_indices else len(episodes_meta)
+        if ep_idx < 0 or ep_idx in used_episode_indices:
+            raise ValueError(f"invalid or duplicate preserved episode index: {ep_idx}")
+        used_episode_indices.add(ep_idx)
 
         # ── 트리밍 ────────────────────────────────────────────────────────
         trim_cfg = edit_meta.get("trim", {})
@@ -450,7 +646,14 @@ def convert_episodes(
             mask_cam = camera_by_id(mask_camera_id) or overview_camera()
             mask_target_id = mask_cam.get("id") if mask_cam else None
             apply_mask = mask_overlay_path if cam.get("id") == mask_target_id else None
-            _encode_video(src, dst, max_duration=video_duration, mask_overlay=apply_mask, ss=0.0)
+            _encode_video(
+                src,
+                dst,
+                max_duration=video_duration,
+                mask_overlay=apply_mask,
+                ss=0.0,
+                time_scale=video_time_scale,
+            )
 
         # 임시 마스크 PNG 정리
         if mask_overlay_path and os.path.exists(mask_overlay_path):
@@ -464,18 +667,29 @@ def convert_episodes(
             "source_take": take_name,
             "task": task,
             "task_index": task_idx,
-            "source_order": ep_idx,
+            "source_order": _source_ep_idx,
+            "original_episode_index": original_ep_idx,
+            "review_excluded": default_excluded,
         })
         source_entry = {
             "episode_index": ep_idx,
+            "original_episode_index": original_ep_idx,
             "lerobot_episode_file": f"episode_{ep_idx:06d}",
             "source_episode_id": ep_id,
             "source_take": take_name,
             "task": task,
             "task_index": task_idx,
             "length": n_frames,
+            "review_excluded": default_excluded,
+            "review_exclusion_reason": replay_result.get("export_exclusion_reason"),
             "video_duration_s": video_duration,
             "full_video_duration_s": full_video_duration,
+            "source_video_duration_s": source_video_duration,
+            "joint_duration_s": joint_duration,
+            "timing": {
+                "mode": timing_mode,
+                "video_time_scale": video_time_scale,
+            },
             "trim": {
                 "enabled": bool(trim_cfg.get("enabled")),
                 "cut_t": trim_cfg.get("cut_t"),
@@ -514,6 +728,11 @@ def convert_episodes(
     os.makedirs(meta_dir, exist_ok=True)
     total_eps = len(episodes_meta)
     total_frames = global_frame_idx
+    if preserve_source_indices and sorted(used_episode_indices) != list(range(total_eps)):
+        raise ValueError(
+            "preserved review indices must form a contiguous 0..N-1 range; "
+            f"got {sorted(used_episode_indices)}"
+        )
 
     cam_feature = {
         "dtype": "video",
@@ -521,7 +740,7 @@ def convert_episodes(
         "names": ["height", "width", "channel"],
         "info": {
             "video.fps": TARGET_FPS,
-            "video.codec": "av1",
+            "video.codec": "h264",
             "video.pix_fmt": "yuv420p",
             "video.is_depth_map": False,
             "has_audio": False,
@@ -561,6 +780,12 @@ def convert_episodes(
         "export_options": {
             "mask_mode": mask_mode,
             "mask_fill_color": mask_fill_color,
+            "video_processing": "opencv_raw_frames",
+            "video_resolution": [IMG_SIZE, IMG_SIZE],
+            "source_metadata_copied": False,
+            "per_episode_timing_modes": ["teaching_normalized", "physical_replay"],
+            "preserve_source_indices": preserve_source_indices,
+            "include_default_excluded": include_default_excluded,
         },
     }
 
@@ -585,14 +810,21 @@ def convert_episodes(
     with open(os.path.join(meta_dir, "source_episodes.csv"), "w", newline="") as f:
         fieldnames = [
             "episode_index",
+            "original_episode_index",
             "lerobot_episode_file",
             "source_episode_id",
             "source_take",
             "task",
             "task_index",
             "length",
+            "review_excluded",
+            "review_exclusion_reason",
             "video_duration_s",
             "full_video_duration_s",
+            "source_video_duration_s",
+            "joint_duration_s",
+            "timing.mode",
+            "timing.video_time_scale",
             "mask.mode",
             "mask.enabled",
             "mask.camera_id",
@@ -604,14 +836,21 @@ def convert_episodes(
         for row in source_map:
             writer.writerow({
                 "episode_index": row["episode_index"],
+                "original_episode_index": row["original_episode_index"],
                 "lerobot_episode_file": row["lerobot_episode_file"],
                 "source_episode_id": row["source_episode_id"],
                 "source_take": row["source_take"],
                 "task": row["task"],
                 "task_index": row["task_index"],
                 "length": row["length"],
+                "review_excluded": row["review_excluded"],
+                "review_exclusion_reason": row["review_exclusion_reason"],
                 "video_duration_s": row["video_duration_s"],
                 "full_video_duration_s": row["full_video_duration_s"],
+                "source_video_duration_s": row["source_video_duration_s"],
+                "joint_duration_s": row["joint_duration_s"],
+                "timing.mode": row["timing"]["mode"],
+                "timing.video_time_scale": row["timing"]["video_time_scale"],
                 "mask.mode": row["mask"]["mode"],
                 "mask.enabled": row["mask"]["enabled"],
                 "mask.camera_id": row["mask"]["camera_id"],

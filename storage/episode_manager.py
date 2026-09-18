@@ -191,7 +191,10 @@ class EpisodeManager:
     def flush_replay_command(self, buffer: list[dict]) -> int:
         if not buffer or not self.current_take_dir:
             return 0
-        fields = ["t_host_ns", "waypoint_idx"] + [f"q{i+1}" for i in range(DOF)] + ["gripper", "gripper_effort"]
+        fields = [
+            "t_host_ns", "scheduled_t_host_ns", "waypoint_idx", "source_idx",
+            "lateness_ms", "velocity",
+        ] + [f"q{i+1}" for i in range(DOF)] + ["gripper", "gripper_effort"]
         path = os.path.join(self.current_take_dir, "replay_command.csv")
         n = self._write_csv(path, fields, buffer)
         print(f"[EpisodeManager] replay_command.csv: {n} rows")
@@ -245,6 +248,39 @@ class EpisodeManager:
         with open(path, "w") as f:
             json.dump(events, f, indent=2)
         print(f"[EpisodeManager] events.json: {len(events)} events")
+
+    def mark_replay_result(
+        self,
+        *,
+        partial: bool,
+        command_samples: int,
+        executed_samples: int,
+        reason: str,
+        abort_class: str | None = None,
+        export_excluded_default: bool = False,
+        diagnostics: dict | None = None,
+    ):
+        """Persist whether this take completed or was intentionally stopped."""
+        if not self.current_take_dir:
+            return
+        result = {
+            "completed": not partial,
+            "partial": bool(partial),
+            "reason": str(reason),
+            "abort_class": abort_class,
+            "export_excluded_default": bool(export_excluded_default),
+            "diagnostics": dict(diagnostics or {}),
+            "command_samples": int(command_samples),
+            "executed_samples": int(executed_samples),
+            "finished_at": datetime.now().isoformat(),
+        }
+        with open(os.path.join(self.current_take_dir, "replay_result.json"), "w") as file:
+            json.dump(result, file, indent=2)
+        self._meta.setdefault("recording", {})["last_replay"] = {
+            **result,
+            "take": self.get_current_take_name(),
+        }
+        self._write_episode_json("meta.json", self._meta)
 
     # ─────────────────────────────────────────────────────────────────
     # Alignment
@@ -331,7 +367,7 @@ class EpisodeManager:
 
         핵심 원칙:
           - executed_joint.csv 를 replay 실제 시간의 ground truth로 사용
-          - target_duration = replay_duration_s * replay_speed  (1x 정상속도 환산)
+          - target_duration = replay_duration_s * replay_speed  (Teaching 속도 환산)
           - 각 카메라: output_fps = n_frames / target_duration
           - frame drop이 있어도 모든 카메라 영상이 같은 길이로 출력됨
         """
@@ -375,12 +411,31 @@ class EpisodeManager:
             legacy = legacy_id_for(cam)
             fdir = frames_dir_name(cam)
             csv_name = camera_csv_name(cam)
+
+            if cam.get("type") == "spinnaker":
+                # 녹화 중엔 센서 원본 모자이크만 저장했으므로, 영상 만들기 전에 여기서
+                # color/AoLP/DoLP/grid 뷰 프레임을 먼저 재구성해야 아래 job들이 소스를 찾음.
+                from nodes.spinnaker_node import reconstruct_polarizer_frame_views
+                n = reconstruct_polarizer_frame_views(os.path.join(self.current_take_dir, fdir))
+                if n:
+                    print(f"[EpisodeManager] {cam['id']}: reconstructed {n} frame views from mosaic")
+
             if "color" in cam.get("streams", []):
                 step_key = "video_color" if legacy == "realsense" else f"video_{cam['id']}"
                 fallback_csv = "camera_frames.csv" if legacy == "realsense" else None
                 jobs.append((step_key, fdir, "color_", video_file_name(cam, "color"), csv_name, fallback_csv))
             if "depth" in cam.get("streams", []):
                 jobs.append(("video_depth", fdir, "depth_", video_file_name(cam, "depth"), csv_name, "camera_frames.csv"))
+            # 편광 카메라: 컬러라이즈된 AoLP/DoLP/2x2 grid 시각화 영상도 생성 (prefix가 raw
+            # aolp_*/dolp_* PNG와 안 겹치게 aolpview_/dolpview_/gridview_ 사용).
+            if "aolp" in cam.get("streams", []):
+                jobs.append((f"video_{cam['id']}_aolp", fdir, "aolpview_", video_file_name(cam, "aolp"), csv_name, None))
+            if "dolp" in cam.get("streams", []):
+                jobs.append((f"video_{cam['id']}_dolp", fdir, "dolpview_", video_file_name(cam, "dolp"), csv_name, None))
+            if "grid" in cam.get("streams", []):
+                jobs.append((f"video_{cam['id']}_grid", fdir, "gridview_", video_file_name(cam, "grid"), csv_name, None))
+            if "stokes" in cam.get("streams", []):
+                jobs.append((f"video_{cam['id']}_stokes", fdir, "stokesview_", video_file_name(cam, "stokes"), csv_name, None))
 
         # Legacy fallback if cameras.json is missing old webcams.
         if not jobs:
@@ -403,6 +458,26 @@ class EpisodeManager:
             _step(step_key, "ok" if r else "failed",
                   f"{target_duration_s:.1f}s" if r else "skipped (no frames)")
         return result
+
+    def regenerate_camera_videos(self, episode_id: str, take: str, on_step=None) -> dict:
+        """
+        이미 완료된 기존 episode/take에 대해 카메라 영상을 다시 생성.
+        처리 로직이 나중에 추가/수정됐을 때(예: 편광 카메라 AoLP/DoLP/grid 뷰 호환 재구성)
+        옛날 take에도 적용하는 용도 — current_take_dir을 일시적으로 바꿔서
+        generate_preview_videos()를 재사용한다.
+        """
+        take_dir = os.path.join(self.dataset_path, episode_id, "takes", take)
+        if not os.path.isdir(take_dir):
+            return {"ok": False, "error": "take not found"}
+
+        prev_episode_id, prev_take_dir = self.current_episode_id, self.current_take_dir
+        self.current_episode_id = episode_id
+        self.current_take_dir = take_dir
+        try:
+            result = self.generate_preview_videos(on_step=on_step)
+        finally:
+            self.current_episode_id, self.current_take_dir = prev_episode_id, prev_take_dir
+        return {"ok": True, "result": result}
 
     def _get_replay_duration(self) -> Optional[float]:
         """executed_joint.csv 첫/마지막 t_host_ns 로 실제 replay 시간(초) 측정."""
@@ -433,7 +508,7 @@ class EpisodeManager:
         """
         output_fps = n_frames / target_duration_s 로 비디오 생성.
 
-        - target_duration_s = replay_duration_s × replay_speed  (1x 정상속도 환산)
+        - target_duration_s = replay_duration_s × replay_speed (Teaching 속도 환산)
         - frame drop이 있어도 모든 카메라 영상이 같은 길이로 출력됨
         - -framerate output_fps 방식 사용: 각 프레임이 1/output_fps 초로 처리되어
           총 duration = n / output_fps = target_duration_s 보장
@@ -628,38 +703,67 @@ class EpisodeManager:
     # Dataset index
     # ─────────────────────────────────────────────────────────────────
 
-    def list_episodes(self) -> list[dict]:
-        episodes = []
+    def _episode_names(self) -> list[str]:
+        names = []
         for name in sorted(os.listdir(self.dataset_path), reverse=True):
             ep_dir = os.path.join(self.dataset_path, name)
-            if not os.path.isdir(ep_dir):
-                continue
+            if os.path.isdir(ep_dir) and os.path.isfile(os.path.join(ep_dir, "meta.json")):
+                names.append(name)
+        return names
+
+    def list_episodes(
+        self,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        lightweight: bool = False,
+    ) -> list[dict]:
+        """List a slice of episodes.
+
+        ``lightweight`` avoids recursive directory-size walks.  Dataset list
+        pagination uses it so initial rendering cost depends on page size, not
+        the total number of episodes or extracted frame files.
+        """
+        episodes = []
+        names = self._episode_names()
+        start = max(0, int(offset))
+        selected_names = names[start:] if limit is None else names[start:start + max(0, int(limit))]
+        for name in selected_names:
+            ep_dir = os.path.join(self.dataset_path, name)
             meta_path = os.path.join(ep_dir, "meta.json")
-            if not os.path.exists(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
                 continue
-            with open(meta_path) as f:
-                meta = json.load(f)
             label_path = os.path.join(ep_dir, "label.json")
             label = {}
             if os.path.exists(label_path):
-                with open(label_path) as f:
-                    label = json.load(f)
+                try:
+                    with open(label_path) as f:
+                        label = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    label = {}
 
             # takes 목록 조회
-            takes = self._list_takes(ep_dir)
+            takes = self._list_takes(ep_dir, include_size=not lightweight)
 
-            episodes.append({
+            episode = {
                 "episode_id": name,
                 "task": meta.get("task", {}).get("instruction", ""),
                 "created_at": meta.get("created_at", ""),
                 "success": label.get("success"),
                 "takes": takes,
                 "takes_count": len(takes),
-                "size_mb": self._dir_size_mb(ep_dir),
-            })
+            }
+            if not lightweight:
+                episode["size_mb"] = self._dir_size_mb(ep_dir)
+            episodes.append(episode)
         return episodes
 
-    def _list_takes(self, ep_dir: str) -> list[dict]:
+    def count_episodes(self) -> int:
+        return len(self._episode_names())
+
+    def _list_takes(self, ep_dir: str, include_size: bool = True) -> list[dict]:
         takes_dir = os.path.join(ep_dir, "takes")
         if not os.path.isdir(takes_dir):
             return []
@@ -679,9 +783,13 @@ class EpisodeManager:
                     video_file = video_file_name(cam, stream)
                     if not os.path.exists(os.path.join(take_dir, video_file)):
                         continue
+                    stream_labels = {
+                        "color": "Color", "depth": "Depth",
+                        "aolp": "AoLP", "dolp": "DoLP", "grid": "2×2 Grid", "stokes": "S1/S2 (bwr)",
+                    }
                     streams.append({
                         "id": stream,
-                        "label": "Depth" if stream == "depth" else "Color",
+                        "label": stream_labels.get(stream, stream.capitalize()),
                         "kind": stream,
                         "video": video_file,
                         "url": f"/api/episodes/{episode_id}/takes/{take_name}/video_camera/{cam['id']}/{stream}",
@@ -704,9 +812,10 @@ class EpisodeManager:
                 "has_webcam_0": os.path.exists(os.path.join(take_dir, "video_webcam_0.mp4")),
                 "has_webcam_1": os.path.exists(os.path.join(take_dir, "video_webcam_1.mp4")),
                 "cameras":      list(camera_videos.values()),
-                "size_mb":     self._dir_size_mb(take_dir),
                 "review_issues": self._load_review_issues(take_dir),
             }
+            if include_size:
+                take_info["size_mb"] = self._dir_size_mb(take_dir)
             take_info["review_issue_count"] = len(take_info["review_issues"])
             takes.append(take_info)
         return takes
@@ -855,11 +964,44 @@ class EpisodeManager:
         THRESHOLD = 0.08  # rad (~4.6°)
         max_err = float(np.max(errors))
         mean_err = float(np.mean(errors))
+        try:
+            cmd_ts = np.array(
+                [int(row["t_host_ns"]) for row in cmd_rows], dtype=np.int64
+            )
+            command_intervals_ms = np.diff(cmd_ts) * 1e-6
+            interval_p95_ms = float(np.percentile(command_intervals_ms, 95))
+            interval_max_ms = float(np.max(command_intervals_ms))
+        except (KeyError, ValueError, TypeError):
+            interval_p95_ms = float("nan")
+            interval_max_ms = float("nan")
+        lateness_values = []
+        for row in cmd_rows:
+            try:
+                lateness_values.append(float(row.get("lateness_ms", "")))
+            except (TypeError, ValueError):
+                continue
+        lateness_p95_ms = (
+            float(np.percentile(lateness_values, 95)) if lateness_values else None
+        )
+        lateness_max_ms = float(np.max(lateness_values)) if lateness_values else None
+        timing_ok = (
+            np.isfinite(interval_p95_ms) and interval_p95_ms <= 30.0
+            and np.isfinite(interval_max_ms) and interval_max_ms <= 100.0
+        )
         quality = {
             "max_tracking_error_rad":  round(max_err, 4),
             "mean_tracking_error_rad": round(mean_err, 4),
+            "command_interval_p95_ms": round(interval_p95_ms, 2),
+            "command_interval_max_ms": round(interval_max_ms, 2),
+            "command_lateness_p95_ms": (
+                round(lateness_p95_ms, 2) if lateness_p95_ms is not None else None
+            ),
+            "command_lateness_max_ms": (
+                round(lateness_max_ms, 2) if lateness_max_ms is not None else None
+            ),
+            "command_timing_ok": bool(timing_ok),
             "tracking_ok":       max_err < THRESHOLD,
-            "save_for_training": max_err < THRESHOLD,
+            "save_for_training": max_err < THRESHOLD and timing_ok,
         }
         path = os.path.join(self.current_take_dir, "quality.json")
         with open(path, "w") as f:

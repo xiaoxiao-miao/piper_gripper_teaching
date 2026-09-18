@@ -12,7 +12,7 @@ import signal
 import threading
 import time
 
-from flask import Flask, Response, send_from_directory
+from flask import Flask, Response, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
@@ -48,6 +48,7 @@ from routes.episode_routes import bp as episode_bp
 from routes.mask_routes import bp as mask_bp
 from routes.camera_routes import bp as camera_bp
 from routes.urdf_routes import bp as urdf_bp
+from routes.screenshot_routes import bp as screenshot_bp
 
 app.register_blueprint(capture_bp)
 app.register_blueprint(robot_bp)
@@ -55,20 +56,35 @@ app.register_blueprint(episode_bp)
 app.register_blueprint(mask_bp)
 app.register_blueprint(camera_bp)
 app.register_blueprint(urdf_bp)
+app.register_blueprint(screenshot_bp)
 
 # ── MJPEG 카메라 스트리밍 ─────────────────────────────────────────────
 
-def _mjpeg_generator(cam_id: str = "primary"):
+MJPEG_STALL_TIMEOUT_S = 15.0  # 이 시간 동안 프레임을 한 장도 못 보내면 스레드를 접는다
+
+
+def _mjpeg_generator(cam_id: str = "primary", mode: str = "rgb"):
     """cam_id: 'primary' | manifest camera id | legacy alias"""
+    # jpg가 계속 None이면(카메라 다운 등) 소켓에 아무것도 안 쓰기 때문에, 이미 끊긴
+    # 클라이언트를 서버가 절대 눈치채지 못해 이 제너레이터(=Werkzeug 스레드)가
+    # 무한정 살아남는 스레드 누수가 있었음 — 일정 시간 프레임이 없으면 제너레이터를
+    # 그냥 끝내서 스레드를 정리한다. 클라이언트(브라우저)는 자체 재시도 로직으로
+    # 새 연결을 새로 맺는다.
+    no_frame_since = time.monotonic()
     while True:
         mgr = controller._cameras
         if mgr is None:
             time.sleep(0.1)
+            if time.monotonic() - no_frame_since > MJPEG_STALL_TIMEOUT_S:
+                return
             continue
-        jpg = mgr.get_jpeg_bytes(cam_id=cam_id, quality=70)
+        jpg = mgr.get_jpeg_bytes(cam_id=cam_id, quality=70, mode=mode)
         if jpg is None:
             time.sleep(0.05)
+            if time.monotonic() - no_frame_since > MJPEG_STALL_TIMEOUT_S:
+                return
             continue
+        no_frame_since = time.monotonic()
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
@@ -76,18 +92,28 @@ def _mjpeg_generator(cam_id: str = "primary"):
         time.sleep(1.0 / 30)
 
 
+def _mjpeg_response(cam_id: str, mode: str = "rgb"):
+    response = Response(
+        _mjpeg_generator(cam_id, mode),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
 @app.get("/stream/camera")
 def stream_camera():
     """Primary stream: RealSense 우선, 없으면 첫 번째 웹캠."""
-    return Response(
-        _mjpeg_generator("primary"),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+    return _mjpeg_response("primary")
 
 
 @app.get("/stream/camera/<cam_id>")
 def stream_camera_by_id(cam_id: str):
-    """개별 카메라 스트림: manifest camera id 또는 legacy alias."""
+    """개별 카메라 스트림: manifest camera id 또는 legacy alias.
+    ?mode=rgb|aolp|dolp|grid|stokes — polarizer(Spinnaker) 카메라 전용, 다른 카메라는 무시됨.
+    """
     mgr = controller._cameras
     manifest = mgr.manifest if mgr else None
     from camera_manifest import camera_by_id, resolve_camera_id
@@ -98,10 +124,8 @@ def stream_camera_by_id(cam_id: str):
             return Response("Not found", status=404)
     elif resolve_camera_id(cam_id, manifest) is None:
         return Response("Not found", status=404)
-    return Response(
-        _mjpeg_generator(cam_id),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+    mode = request.args.get("mode", "rgb")
+    return _mjpeg_response(cam_id, mode)
 
 
 VENDOR_DIR = os.path.join(ROOT, "vendor")
@@ -292,10 +316,12 @@ let disableTimerHandle = null;
 let calibMin = Array(6).fill(Infinity);
 let calibMax = Array(6).fill(-Infinity);
 let calibResultLimits = null;
+let calibServerValid = Array(6).fill(false);
 
 function resetCalibTracking() {
   calibMin = Array(6).fill(Infinity);
   calibMax = Array(6).fill(-Infinity);
+  calibServerValid = Array(6).fill(false);
 }
 
 function showCalibResult(limits) {
@@ -373,6 +399,8 @@ function cancelDisableCountdown() {
 
 const MODE_COLORS = {
   TEACH_RECORDING: '#d97706',
+  TEACH_STARTING: '#2563eb',
+  TEACH_STOPPING: '#7c3aed',
   REPLAY_RECORDING: '#dc2626',
   REVIEW: '#6366f1',
   SAVED: '#22c55e',
@@ -385,6 +413,7 @@ const ACTION_DEFS = {
   confirm_ready_pose:{ label: 'Confirm Ready Pose',      cls: 'btn-primary' },
   calibrate:         { label: 'Calibrate Joint Range',   cls: 'btn-gray' },
   stop_calibration:  { label: 'Finish Calibration',      cls: 'btn-success', large: true },
+  resume_calibration:{ label: 'Resume Calibration',      cls: 'btn-free' },
   start_teach:       { label: 'Start Teaching',          cls: 'btn-success' },
   stop_teach:        { label: 'STOP TEACHING',           cls: 'btn-success', large: true },
   return_home:       { label: 'Return Home',             cls: 'btn-primary' },
@@ -406,6 +435,7 @@ const ACTION_APIS = {
     .then(r => r.json()).then(data => {
       if (data.ok) showCalibResult(data.limits);
     }),
+  resume_calibration: () => fetch('/api/robot/calibrate/resume', { method: 'POST' }),
   start_teach: async () => {
     if (selectedTeachMode === 'phone_mouse') {
       // Phone Mouse 모드: teach/start (→ TEACH_RECORDING 진입) 후 즉시 phone_mouse/enable (freedrive 타이머 취소)
@@ -430,7 +460,14 @@ const ACTION_APIS = {
   },
   stop_teach:         () => fetch('/api/teach/stop', { method: 'POST' }),
   return_home:        () => fetch('/api/home', { method: 'POST' }),
-  start_replay:       () => fetch('/api/replay/start', { method: 'POST' }),
+  start_replay:       async () => {
+    const response = await fetch('/api/replay/start', { method: 'POST' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      alert(data.reason || `Replay start failed (${response.status})`);
+    }
+    return data;
+  },
   stop_replay:        () => fetch('/api/replay/stop', { method: 'POST' }),
   open_gripper:       () => fetch('/api/robot/gripper/open', { method: 'POST' }),
   close_gripper:      () => fetch('/api/robot/gripper/close',{ method: 'POST' }),
@@ -466,7 +503,7 @@ function render(mode, actions, episode) {
   // Main actions (ordered)
   const ORDER = [
     'connect', 'confirm_ready_pose',
-    'calibrate',
+    'calibrate', 'stop_calibration', 'resume_calibration',
     'start_teach', 'stop_teach',
     'return_home',
     'start_replay', 'stop_replay',
@@ -480,6 +517,7 @@ function render(mode, actions, episode) {
     const def = ACTION_DEFS[a];
     if (!def) return;
     const btn = makeBtn(a, def.label, def.cls, actions, def.confirm);
+    if (a === 'stop_calibration') btn.disabled = !calibServerValid.every(Boolean);
     if (def.large) btn.style.padding = '28px 16px';
     container.appendChild(btn);
   });
@@ -763,6 +801,7 @@ socket.on('mode_change', data => {
 socket.on('robot_state', data => {
   if (currentMode !== 'CALIBRATING') return;
   if (!data.position) return;
+  if (Array.isArray(data.calibration_valid)) calibServerValid = data.calibration_valid;
   for (let i = 0; i < 6; i++) {
     const v = data.position[i];
     if (v < calibMin[i]) calibMin[i] = v;
@@ -775,8 +814,14 @@ socket.on('robot_state', data => {
   el.textContent = labels.map((l,i) => {
     const lo = calibMin[i] === Infinity  ? '—' : calibMin[i].toFixed(2);
     const hi = calibMax[i] === -Infinity ? '—' : calibMax[i].toFixed(2);
-    return l + ': [' + lo + ', ' + hi + ']';
+    const span = data.calibration_span && data.calibration_span[i];
+    const valid = calibServerValid[i] ? ' ✓' : ' ✗';
+    return l + ': [' + lo + ', ' + hi + '] span=' +
+      (span == null ? '—' : span.toFixed(3)) + valid;
   }).join('  ');
+  const finish = Array.from(document.querySelectorAll('button'))
+    .find(b => b.textContent === 'Finish Calibration');
+  if (finish) finish.disabled = !calibServerValid.every(Boolean);
 });
 socket.on('logger_state', data => {
   if (data.episode_id) episodeId = data.episode_id;
@@ -796,7 +841,13 @@ def serve_spa(path=""):
     if os.path.exists(FRONTEND_BUILD):
         index = os.path.join(FRONTEND_BUILD, "index.html")
         if os.path.exists(index):
-            return send_from_directory(FRONTEND_BUILD, "index.html")
+            response = send_from_directory(FRONTEND_BUILD, "index.html")
+            # index.html contains the current hashed JS filename. Caching an
+            # older index keeps clients on an obsolete UI even after a build.
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
     return "<h2>Piper Cowork backend running on port 5002.<br>Build the React frontend to serve the UI.</h2>", 200
 
 # ── 종료 처리 ─────────────────────────────────────────────────────────

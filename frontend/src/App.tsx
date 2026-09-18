@@ -11,8 +11,10 @@ import CapturePage from "./pages/CapturePage";
 import DatasetPage from "./pages/DatasetPage";
 import DiagnosticsPage from "./pages/DiagnosticsPage";
 import SetupPage from "./pages/SetupPage";
+import ScreenshotsGallery from "./pages/dataset/ScreenshotsGallery";
+import SafetyBanner from "./components/SafetyBanner";
 
-export type Page = "capture" | "dataset" | "diagnostics" | "setup";
+export type Page = "capture" | "dataset" | "screenshots" | "diagnostics" | "setup";
 
 export default function App() {
   const [mode, setMode] = useState<AppMode>("IDLE");
@@ -102,6 +104,7 @@ export default function App() {
 
   const renderMain = () => {
     if (page === "dataset") return <DatasetPage />;
+    if (page === "screenshots") return <ScreenshotsGallery />;
     if (page === "diagnostics") return <DiagnosticsPage devMode={devMode} robot={robot} camera={camera} />;
     if (page === "setup") return <SetupPage robot={robot} />;
     return (
@@ -127,6 +130,7 @@ export default function App() {
         devMode={devMode}
         onToggleDev={() => setDevMode(v => !v)}
       />
+      <SafetyBanner robot={robot} />
       <div style={styles.body}>
         <WorkflowNav
           page={page}

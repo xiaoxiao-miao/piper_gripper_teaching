@@ -1,7 +1,7 @@
 import type { TakeJointsData } from "../../types";
 
 export type ViewMode = "compact" | "thumbnail" | "grid";
-export type InspectorTab = "preview" | "trajectory" | "postprocess" | "export";
+export type InspectorTab = "preview" | "trajectory" | "debug" | "postprocess" | "export";
 
 export const COMPLETENESS: Array<{ key: string; label: string; title: string }> = [
   { key: "rgb", label: "RGB", title: "RealSense RGB video" },

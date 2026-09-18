@@ -5,7 +5,9 @@ export type AppMode =
   | "READY"
   | "CALIBRATING"
   | "TEACH_READY"
+  | "TEACH_STARTING"
   | "TEACH_RECORDING"
+  | "TEACH_STOPPING"
   | "TRAJECTORY_CHECK"
   | "RETURN_HOME"
   | "REPLAY_READY"
@@ -13,7 +15,9 @@ export type AppMode =
   | "PROCESSING"
   | "REVIEW"
   | "SAVED"
-  | "DISCARDED";
+  | "DISCARDED"
+  | "DEBUG_RETURN"
+  | "DEBUG_REPLAY";
 
 export type SaveStepStatus = "waiting" | "running" | "ok" | "failed";
 
@@ -42,12 +46,29 @@ export interface RobotState {
   connected: boolean;
   position?: number[];     // q1..q6 (rad)
   gripper?: number;
+  gripper_responsive?: boolean | null;  // false=마지막 명령이 피드백에 반영 안 됨(케이블 단선 등)
   velocity?: number[];
   is_moving?: boolean;
   mode?: string;
   hz?: number;
   replay_progress?: number;  // 0.0~1.0 재생 진행률 (REPLAY_RECORDING 중)
   joint_limits?: { min: number[]; max: number[] };  // ROM 캘리브레이션 결과
+  feedback_age_s?: number | null;
+  motor_enable_status?: boolean[];
+  motor_fault_codes?: number[];
+  motor_faults?: string[][];
+  motor_status_age_s?: number | null;
+  transition_state?: string;
+  transition_error?: string | null;
+  calibration_span?: number[];
+  calibration_valid?: boolean[];
+  calibration_min_span?: number;
+  safety_latched?: boolean;
+  safety_reason?: string | null;
+  can_healthy?: boolean;
+  abort_class?: "MOTION_ABORTED" | "SAFETY_LOCKED" | "CAN_LOST" | null;
+  last_motion_abort?: { reason?: string; abort_class?: string; [key: string]: unknown };
+  recovery?: Record<string, unknown>;
 }
 
 export interface SingleCameraState {
@@ -70,6 +91,13 @@ export interface SingleCameraState {
   written_frames?: number;
   dropped_frames?: number;
   queue_len?: number;
+  // Spinnaker(polarizer) 전용
+  pixel_format?: string;
+  exposure_us?: number;
+  exposure_us_min?: number;
+  exposure_us_max_hw?: number;
+  exposure_us_max_hint_for_target_fps?: number;
+  exposure_auto?: string; // "Off" | "Continuous" | ...
 }
 
 export interface CameraState {
@@ -234,6 +262,9 @@ export interface MaskMeta {
 export interface EditMeta {
   trim: TrimMeta;
   mask: MaskMeta;
+  timing?: {
+    mode: "teaching_normalized" | "physical_replay";
+  };
 }
 
 export interface MaskLibraryEntry {

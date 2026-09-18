@@ -67,6 +67,12 @@ def motors_disable():
     return jsonify(_ctrl().motors_disable())
 
 
+@bp.post("/motors/recover")
+def motors_recover():
+    data = request.get_json(silent=True) or {}
+    return jsonify(_ctrl().motors_recover(confirmed=data.get("confirmed") is True))
+
+
 @bp.post("/phone_mouse/enable")
 def phone_mouse_enable():
     """Phone Mouse 모드 진입: freedrive 타이머 취소 + 즉시 teach recording 시작"""
@@ -83,6 +89,12 @@ def calibrate_start():
 def calibrate_stop():
     """ROM calibration 종료: limits 저장 후 이전 상태 복귀"""
     return jsonify(_ctrl().stop_calibration())
+
+
+@bp.post("/calibrate/resume")
+def calibrate_resume():
+    """Hold 이후 기존 측정 범위를 유지한 채 freedrive 재개."""
+    return jsonify(_ctrl().resume_calibration())
 
 
 @bp.get("/calibrate/limits")

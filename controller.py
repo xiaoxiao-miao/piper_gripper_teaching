@@ -15,20 +15,33 @@ Controller
   - SocketIO emit은 on_emit 콜백으로 주입받음 (테스트 가능)
 """
 
+import csv
 import json
 import os
 import threading
 import time
+from datetime import datetime
 from enum import Enum, auto
 from typing import Callable, Optional
 
 import rclpy
+import numpy as np
 from rclpy.executors import MultiThreadedExecutor
 
 from nodes.piper_node import PiperTeachReplayNode
 from nodes.camera_manager import CameraManager
 from storage.episode_manager import EpisodeManager
-from config import REPLAY_DEFAULT_SPEED, HOME_APPROACH_SPEED, DATASET_PATH, GRIPPER_OPEN_RAD, JOINT_LIMITS_FILE
+from config import (
+    REPLAY_DEFAULT_SPEED,
+    HOME_APPROACH_SPEED,
+    DATASET_PATH,
+    GRIPPER_OPEN_RAD,
+    GRIPPER_TEACH_START_PCT,
+    JOINT_LIMITS_FILE,
+    MAX_JOINT_VELOCITY_RAD_S,
+)
+
+CALIBRATION_POSE_FILE = os.path.join(DATASET_PATH, "calibration_pose.json")
 
 
 class State(str, Enum):
@@ -37,7 +50,9 @@ class State(str, Enum):
     READY = "READY"
     CALIBRATING = "CALIBRATING"
     TEACH_READY = "TEACH_READY"
+    TEACH_STARTING = "TEACH_STARTING"
     TEACH_RECORDING = "TEACH_RECORDING"
+    TEACH_STOPPING = "TEACH_STOPPING"
     TRAJECTORY_CHECK = "TRAJECTORY_CHECK"
     RETURN_HOME = "RETURN_HOME"
     REPLAY_READY = "REPLAY_READY"
@@ -46,6 +61,8 @@ class State(str, Enum):
     REVIEW = "REVIEW"
     SAVED = "SAVED"
     DISCARDED = "DISCARDED"
+    DEBUG_RETURN = "DEBUG_RETURN"
+    DEBUG_REPLAY = "DEBUG_REPLAY"
 
 
 _NEXT_ACTIONS = {
@@ -54,7 +71,9 @@ _NEXT_ACTIONS = {
     State.READY:            "System ready. Press 'Confirm Ready Pose' to start a teaching session.",
     State.CALIBRATING:      "Move arm freely through its full range of motion, then press 'Finish Calibration'.",
     State.TEACH_READY:      "Robot is in home position. Press 'Start Teaching' when ready.",
+    State.TEACH_STARTING:   "Preparing freedrive and waiting for six-axis motor feedback...",
     State.TEACH_RECORDING:  "Guide the robot arm by hand. Press 'Stop Teaching' when done.",
+    State.TEACH_STOPPING:   "Stopping teaching, re-arming the robot, and preserving the trajectory...",
     State.TRAJECTORY_CHECK: "Trajectory recorded. Review the summary and return home before replay.",
     State.RETURN_HOME:      "Robot is returning to home position. Please wait.",
     State.REPLAY_READY:     "Robot is at home. Set replay speed and press 'Start Replay Recording'.",
@@ -63,15 +82,19 @@ _NEXT_ACTIONS = {
     State.REVIEW:           "Review the episode. Label as success/failure and save or discard.",
     State.SAVED:            "Episode saved. Start a new episode or add another take.",
     State.DISCARDED:        "Episode discarded. You can start a new episode.",
+    State.DEBUG_RETURN:     "Dataset debug: returning to the selected trajectory start.",
+    State.DEBUG_REPLAY:     "Dataset debug replay is running without camera recording.",
 }
 
 _AVAILABLE_ACTIONS: dict[State, list[str]] = {
     State.IDLE:             ["connect"],
     State.CONNECTING:       [],
     State.READY:            ["confirm_ready_pose", "calibrate", "open_gripper", "close_gripper"],
-    State.CALIBRATING:      ["stop_calibration", "hold_position"],
+    State.CALIBRATING:      ["stop_calibration", "hold_position", "resume_calibration"],
     State.TEACH_READY:      ["start_teach", "calibrate", "open_gripper", "close_gripper"],
+    State.TEACH_STARTING:   [],
     State.TEACH_RECORDING:  ["stop_teach", "open_gripper", "close_gripper", "hold_position"],
+    State.TEACH_STOPPING:   [],
     State.TRAJECTORY_CHECK: ["return_home", "return_home_direct", "discard_episode"],
     State.RETURN_HOME:      ["hold_position"],
     State.REPLAY_READY:     ["start_replay", "discard_episode", "open_gripper", "close_gripper"],
@@ -80,6 +103,8 @@ _AVAILABLE_ACTIONS: dict[State, list[str]] = {
     State.REVIEW:           ["save_episode", "discard_episode", "retake_replay", "retake_teach"],
     State.SAVED:            ["new_episode", "add_take"],
     State.DISCARDED:        ["new_episode"],
+    State.DEBUG_RETURN:     ["hold_position"],
+    State.DEBUG_REPLAY:     ["stop_debug_replay", "hold_position"],
 }
 
 
@@ -93,6 +118,24 @@ class Controller:
         self._on_emit = on_emit or (lambda e, d: None)
         self._state = State.IDLE
         self._lock = threading.Lock()
+        self._teach_stop_lock = threading.Lock()
+        self._replay_start_lock = threading.Lock()
+        self._replay_partial = False
+        self._replay_manual_stop_requested = False
+        self._debug_lock = threading.RLock()
+        self._debug_trajectory: list[dict] = []
+        self._debug_source: dict = {}
+        self._debug_check: dict = {}
+        self._debug_start_ready = False
+        self._debug_operation: Optional[str] = None
+        self._debug_previous_state: Optional[State] = None
+        self._debug_run_dir: Optional[str] = None
+        self._debug_started_at: Optional[str] = None
+        self._debug_speed: Optional[float] = None
+        self._debug_stop_requested = False
+        self._debug_last_error = ""
+        self._debug_last_diagnostics: dict = {}
+        self._debug_sequence: Optional[dict] = None
 
         # ── 서브시스템 ──────────────────────────────────────────────
         self._piper: Optional[PiperTeachReplayNode] = None
@@ -146,6 +189,7 @@ class Controller:
         }
         if self._trajectory_check:
             status["trajectory_summary"] = self._trajectory_check
+        status["replay_partial"] = bool(getattr(self, "_replay_partial", False))
         return status
 
     def _add_event_log(self, message: str):
@@ -178,10 +222,28 @@ class Controller:
             "connected": True,
             "position": [round(v, 4) for v in state["position"]],
             "gripper": round(state["gripper"], 4),
+            "gripper_responsive": state.get("gripper_responsive"),
             "velocity": [round(v, 4) for v in state["velocity"]],
             "is_moving": state["is_moving"],
             "mode": state["mode"],
             "hz": state["hz"],
+            "replay_progress": state.get("replay_progress", 0.0),
+            "feedback_age_s": state.get("feedback_age_s"),
+            "motor_enable_status": state.get("motor_enable_status", []),
+            "motor_fault_codes": state.get("motor_fault_codes", []),
+            "motor_faults": state.get("motor_faults", []),
+            "motor_status_age_s": state.get("motor_status_age_s"),
+            "transition_state": state.get("transition_state"),
+            "transition_error": state.get("transition_error"),
+            "calibration_span": state.get("calibration_span", []),
+            "calibration_valid": state.get("calibration_valid", []),
+            "calibration_min_span": state.get("calibration_min_span"),
+            "safety_latched": state.get("safety_latched", False),
+            "safety_reason": state.get("safety_reason"),
+            "can_healthy": state.get("can_healthy", True),
+            "abort_class": state.get("abort_class"),
+            "last_motion_abort": state.get("last_motion_abort", {}),
+            "recovery": state.get("recovery", {}),
         })
 
     def _emit_camera_state(self):
@@ -262,6 +324,19 @@ class Controller:
     def confirm_ready_pose(self) -> dict:
         if self.get_state() != State.READY:
             return {"ok": False, "reason": "Not in READY state"}
+
+        # gripper close 시 기록된 암 위치를 캘리브레이션 포즈로 저장
+        if self._piper:
+            pose = self._piper.get_gripper_close_arm_pos()
+            if pose:
+                try:
+                    os.makedirs(os.path.dirname(CALIBRATION_POSE_FILE), exist_ok=True)
+                    with open(CALIBRATION_POSE_FILE, "w") as f:
+                        json.dump(pose, f)
+                    self._add_event_log(f"Calibration pose saved: {[round(v,3) for v in pose]}")
+                except Exception as e:
+                    self._add_event_log(f"Failed to save calibration pose: {e}")
+
         self._set_state(State.TEACH_READY)
         return {"ok": True}
 
@@ -275,17 +350,62 @@ class Controller:
         if self._episode.current_episode_id is None:
             self._episode.create_episode(task=task, operator=operator)
 
-        self._piper.start_teach(disable_delay=5.0)
-        self._set_state(State.TEACH_RECORDING)
+        # Page load/connect must never move hardware.  Apply the slightly-open
+        # preset only when the operator explicitly starts a Teach run.
+        self._piper.gripper_set(GRIPPER_TEACH_START_PCT)
+        self._piper.start_teach(
+            disable_delay=5.0,
+            failure_callback=self._on_teach_release_failed,
+            started_callback=self._on_teach_recording_started,
+        )
+        self._set_state(State.TEACH_STARTING)
         take = self._episode.get_current_take_name()
-        self._add_event_log(f"Teaching started: {task} ({take})")
-        return {"ok": True, "episode_id": self._episode.current_episode_id, "take": take}
+        self._add_event_log(
+            f"Teaching started: {task} ({take}), gripper={GRIPPER_TEACH_START_PCT:.0f}%"
+        )
+        return {
+            "ok": True,
+            "episode_id": self._episode.current_episode_id,
+            "take": take,
+            "gripper_pct": GRIPPER_TEACH_START_PCT,
+        }
+
+    def _on_teach_release_failed(self, reason: str):
+        if self.get_state() == State.TEACH_STARTING:
+            self._add_event_log(f"Teaching cancelled: freedrive handshake failed: {reason}")
+            self._set_state(State.TEACH_READY)
+
+    def _on_teach_recording_started(self):
+        """Publish TEACH_RECORDING only after all six axes report disabled."""
+        if self.get_state() == State.TEACH_STARTING:
+            self._set_state(State.TEACH_RECORDING)
 
     def stop_teach(self) -> dict:
+        # Re-arm/trajectory processing takes long enough for a user (or two UIs)
+        # to submit the button repeatedly while the state still says RECORDING.
+        # Only the first request may perform the motor handshake and endpoint seed.
+        if not self._teach_stop_lock.acquire(blocking=False):
+            return {"ok": False, "reason": "Teach stop is already in progress"}
+        try:
+            return self._stop_teach_once()
+        finally:
+            self._teach_stop_lock.release()
+
+    def _stop_teach_once(self) -> dict:
         if self.get_state() != State.TEACH_RECORDING:
             return {"ok": False, "reason": "Not in TEACH_RECORDING state"}
 
-        self._teach_buffer = self._piper.stop_teach()
+        # Change state before the blocking re-arm handshake.  This makes a
+        # second UI/client request harmless even when it arrives from another
+        # device while the first request is still running.
+        self._set_state(State.TEACH_STOPPING)
+        teach_buffer = self._piper.stop_teach()
+        if teach_buffer is None:
+            reason = self._piper._last_transition_error or "failed to re-arm robot"
+            self._add_event_log(f"Teaching stop failed: {reason}")
+            self._set_state(State.TEACH_RECORDING)
+            return {"ok": False, "reason": reason}
+        self._teach_buffer = teach_buffer
 
         if len(self._teach_buffer) < 10:
             self._add_event_log("Teaching too short, discarding")
@@ -329,25 +449,41 @@ class Controller:
         if not ok:
             self._add_event_log("safe_return_to_start refused — reverting to TRAJECTORY_CHECK")
             self._set_state(State.TRAJECTORY_CHECK)
-            return {"ok": False, "reason": "safe_return_to_start refused"}
+            reason = self._piper._last_transition_error or "safe_return_to_start refused"
+            return {"ok": False, "reason": reason}
 
         return {"ok": True}
 
     def return_home_direct(self) -> dict:
         """역방향 궤적 없이 SAFE_RETURN_WAYPOINTS 경유로 바로 홈 복귀."""
-        if self.get_state() != State.TRAJECTORY_CHECK:
-            return {"ok": False, "reason": "Must be in TRAJECTORY_CHECK state"}
+        with self._lock:
+            if self._state != State.TRAJECTORY_CHECK:
+                return {"ok": False, "reason": "Must be in TRAJECTORY_CHECK state"}
+            self._state = State.RETURN_HOME
         if self._piper is None:
+            self._set_state(State.TRAJECTORY_CHECK)
             return {"ok": False, "reason": "Robot not connected"}
 
-        self._set_state(State.RETURN_HOME)
+        self._on_emit("mode_change", self.get_status())
+        self._add_event_log(f"State → {State.RETURN_HOME.value}")
         self._add_event_log("Returning home directly via safe waypoints (no backtrace)")
 
-        ok = self._piper.go_to_safe_ready(done_callback=self._on_home_reached, abort_callback=self._on_home_abort)
+        teach_start = self._get_teach_start_position()
+        if teach_start is None:
+            self._set_state(State.TRAJECTORY_CHECK)
+            return {"ok": False, "reason": "No teach start position available"}
+        ok = self._piper.go_to_safe_ready(
+            done_callback=self._on_home_reached,
+            abort_callback=self._on_home_abort,
+            final_position=teach_start,
+        )
         if not ok:
             self._add_event_log("go_to_safe_ready refused — reverting to TRAJECTORY_CHECK")
             self._set_state(State.TRAJECTORY_CHECK)
-            return {"ok": False, "reason": "SAFE_RETURN_WAYPOINTS not configured. Set them in the Setup page first."}
+            reason = self._piper._last_transition_error or (
+                "SAFE_RETURN_WAYPOINTS not configured. Set them in the Setup page first."
+            )
+            return {"ok": False, "reason": reason}
 
         return {"ok": True}
 
@@ -399,22 +535,74 @@ class Controller:
         return err < tol, round(err, 4)
 
     def start_replay(self, speed_scale: Optional[float] = None) -> dict:
+        replay_lock = getattr(self, "_replay_start_lock", None)
+        if replay_lock is None:
+            replay_lock = threading.Lock()
+            self._replay_start_lock = replay_lock
+        if not replay_lock.acquire(blocking=False):
+            return {"ok": False, "reason": "Replay start is already in progress"}
+        try:
+            return self._start_replay_once(speed_scale)
+        finally:
+            replay_lock.release()
+
+    def _start_replay_once(self, speed_scale: Optional[float] = None) -> dict:
+        def reject(reason: str, **details) -> dict:
+            self._add_event_log(f"Replay start rejected: {reason}")
+            return {"ok": False, "reason": reason, **details}
+
         if self.get_state() != State.REPLAY_READY:
-            return {"ok": False, "reason": "Must be in REPLAY_READY state"}
+            return reject("Must be in REPLAY_READY state")
         if not self._smoothed_trajectory:
-            return {"ok": False, "reason": "No trajectory available"}
+            return reject("No trajectory available")
         if self._piper is None:
-            return {"ok": False, "reason": "Robot not connected"}
+            return reject("Robot not connected")
 
         at_start, err = self._is_at_trajectory_start(tol=0.06)
         if not at_start:
-            return {
-                "ok": False,
-                "reason": f"Robot not at trajectory start (err={err} rad > 0.06). Return home first.",
-            }
+            return reject(
+                f"Robot not at trajectory start (err={err} rad > 0.06). Return home first."
+            )
 
         speed = speed_scale if speed_scale is not None else self._replay_speed
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return reject("Invalid replay speed")
+        base_max_velocity = float(
+            self._trajectory_check.get("max_joint_velocity_rad_s", 0.0) or 0.0
+        )
+        effective_max_velocity = base_max_velocity * speed
+        speed_adjusted = False
+        requested_speed = speed
+        if effective_max_velocity > MAX_JOINT_VELOCITY_RAD_S:
+            safe_speed = (
+                MAX_JOINT_VELOCITY_RAD_S / base_max_velocity
+                if base_max_velocity > 0 else 0.0
+            )
+            # A recorded max can put a nominal 50% setting a few thousandths
+            # above the limit.  Clamp only this near-boundary case; materially
+            # unsafe requests (for example 70% here) remain explicit failures.
+            if 0.0 < speed - safe_speed <= 0.02:
+                speed = max(0.05, safe_speed * 0.99)
+                effective_max_velocity = base_max_velocity * speed
+                speed_adjusted = True
+                self._add_event_log(
+                    f"Replay speed safety-clamped: {requested_speed:.1%} → {speed:.1%}"
+                )
+            else:
+                recommended = max(0.0, int(safe_speed * 1000) / 1000.0)
+                return reject(
+                    f"Replay speed {speed:.0%} requires {effective_max_velocity:.3f}rad/s, "
+                    f"above the {MAX_JOINT_VELOCITY_RAD_S:.3f}rad/s limit. "
+                    f"Use {recommended:.1%} or slower.",
+                    requested_speed=speed,
+                    recommended_max_speed=recommended,
+                    effective_max_velocity_rad_s=round(effective_max_velocity, 4),
+                )
         self._replay_speed = speed   # cleanup 시 동일한 속도로 비디오 인코딩
+        self._replay_partial = False
+        self._replay_manual_stop_requested = False
         self._set_state(State.REPLAY_RECORDING)
 
         # 카메라 녹화 시작 (연결된 모든 카메라)
@@ -424,32 +612,67 @@ class Controller:
         self._add_event_log(f"Replay started (speed={speed})")
 
         # 로봇 replay
-        self._piper.start_replay(
+        started = self._piper.start_replay(
             self._smoothed_trajectory,
             speed_scale=speed,
             done_callback=self._on_replay_done,
         )
-        return {"ok": True}
+        if not started:
+            if self._cameras:
+                self._cameras.stop_all_recording()
+            reason = self._piper._last_transition_error or "failed to prepare joint control"
+            self._add_event_log(f"Replay start failed: {reason}")
+            self._set_state(State.REPLAY_READY)
+            return reject(reason)
+        return {
+            "ok": True,
+            "speed_scale_applied": round(speed, 4),
+            "speed_adjusted": speed_adjusted,
+        }
 
     def _on_replay_done(self):
-        self._stop_replay_cleanup()
+        worker = self._piper.get_replay_worker_status().get("result", {}) if self._piper else {}
+        stopped = bool(worker.get("stopped"))
+        if worker and not worker.get("ok") and not stopped:
+            reason = worker.get("error") or "replay worker failed"
+            self._add_event_log(f"Replay aborted: {reason}")
+            self._stop_replay_cleanup(
+                partial=True,
+                abort_reason=reason,
+                abort_class=worker.get("abort_class") or "MOTION_ABORTED",
+                worker_diagnostics=worker,
+            )
+            return
+        if stopped:
+            self._add_event_log("Replay stopped by operator — saving partial recording")
+        self._stop_replay_cleanup(partial=stopped)
 
     def stop_replay(self) -> dict:
         """사용자가 수동으로 멈춤"""
         if self.get_state() != State.REPLAY_RECORDING:
             return {"ok": False, "reason": "Not in REPLAY_RECORDING state"}
-        # replay thread에 중단 신호 (join하지 않음: cleanup이 main thread에서 처리)
+        self._replay_manual_stop_requested = True
+        self._replay_partial = True
+        # The subprocess owns command timing and flushes its CSV only on exit.
+        # Wait for the monitor to collect it before starting episode processing.
         if self._piper:
-            self._piper._replay_stop_event.set()
-        self._stop_replay_cleanup()
-        return {"ok": True}
+            self._piper.stop_replay()
+        self._stop_replay_cleanup(partial=True)
+        return {"ok": True, "partial": True, "next_state": "PROCESSING"}
 
-    def _stop_replay_cleanup(self):
+    def _stop_replay_cleanup(
+        self,
+        partial: bool = False,
+        abort_reason: str = "",
+        abort_class: str | None = None,
+        worker_diagnostics: Optional[dict] = None,
+    ):
         # 이중 호출 방지: 상태를 원자적으로 확인 후 변경
         # (자연 완료 시 replay thread 내부에서, 수동 중단 시 main thread에서 모두 호출될 수 있음)
         with self._lock:
             if self._state != State.REPLAY_RECORDING:
                 return  # 이미 cleanup 완료
+            self._replay_partial = bool(partial or self._replay_partial)
             self._state = State.PROCESSING  # ← replay 완료, 후처리 시작
 
         # PROCESSING 상태 즉시 알림 (프론트엔드가 진행 표시 시작)
@@ -474,6 +697,15 @@ class Controller:
         self._episode.flush_replay_command(cmd_buf)
         self._episode.flush_camera_frames_multi(cam_buffers)
         self._episode.flush_events(self._piper.get_events() if self._piper else [])
+        self._episode.mark_replay_result(
+            partial=self._replay_partial,
+            command_samples=len(cmd_buf),
+            executed_samples=len(exec_buf),
+            reason=abort_reason or ("operator_stop" if self._replay_partial else "completed"),
+            abort_class=abort_class,
+            export_excluded_default=bool(abort_class),
+            diagnostics=worker_diagnostics,
+        )
         _progress("flush_csv", "ok", f"exec={len(exec_buf)} cmd={len(cmd_buf)}")
 
         # ── 프레임 정렬 ───────────────────────────────────────────────
@@ -491,7 +723,10 @@ class Controller:
         with self._lock:
             self._state = State.REVIEW
         self._on_emit("mode_change", self.get_status())
-        self._add_event_log(f"Replay done → REVIEW (cam={total_cam}, exec={len(exec_buf)} samples)")
+        completion = "partial" if self._replay_partial else "complete"
+        self._add_event_log(
+            f"Replay {completion} → REVIEW (cam={total_cam}, exec={len(exec_buf)} samples)"
+        )
 
     def save_episode(self, success: bool, reason: str = "") -> dict:
         if self.get_state() != State.REVIEW:
@@ -637,29 +872,807 @@ class Controller:
         return {"ok": True, "episode_id": self._episode.current_episode_id}
 
     # ─────────────────────────────────────────────────────────────────
+    # Dataset debug replay (no camera recording, isolated output)
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _debug_idle_states() -> set[State]:
+        return {
+            State.IDLE,
+            State.READY,
+            State.TEACH_READY,
+            State.REVIEW,
+            State.SAVED,
+            State.DISCARDED,
+        }
+
+    def get_debug_replay_status(self) -> dict:
+        with self._debug_lock:
+            source = {
+                key: value for key, value in self._debug_source.items()
+                if key != "take_dir"
+            }
+            loaded = bool(self._debug_trajectory)
+            operation = self._debug_operation
+            start_ready = self._debug_start_ready
+            error = self._debug_last_error
+            run_dir = self._debug_run_dir
+            diagnostics = dict(self._debug_last_diagnostics)
+            current_sequence = getattr(self, "_debug_sequence", None)
+            sequence = dict(current_sequence) if current_sequence else None
+            if sequence:
+                sequence.pop("entries", None)
+                sequence.pop("root", None)
+                sequence.pop("previous_state", None)
+                sequence.pop("results", None)
+
+        start_error = None
+        if loaded and self._piper is not None:
+            q0 = [self._debug_trajectory[0][f"q{i}"] for i in range(1, 7)]
+            current = self._piper.get_state().get("position", [])
+            if len(current) >= 6:
+                start_error = max(abs(float(current[i]) - q0[i]) for i in range(6))
+                if start_error > 0.06:
+                    start_ready = False
+
+        state = self.get_state()
+        idle = state in self._debug_idle_states()
+        return {
+            "ok": True,
+            "loaded": loaded,
+            "source": source,
+            "trajectory_check": self._debug_check,
+            "operation": operation,
+            "start_ready": bool(start_ready),
+            "start_error_rad": round(start_error, 4) if start_error is not None else None,
+            "robot_connected": self._piper is not None,
+            "controller_state": state.value,
+            "can_return": bool(loaded and self._piper is not None and idle and not operation),
+            "can_start": bool(
+                loaded and self._piper is not None and idle and not operation
+                and start_ready and start_error is not None and start_error <= 0.06
+            ),
+            "last_error": error,
+            "last_run_dir": os.path.relpath(run_dir, DATASET_PATH) if run_dir else None,
+            "last_diagnostics": diagnostics,
+            "worker": self._piper.get_replay_worker_status() if self._piper else {},
+            "sequence": sequence,
+        }
+
+    def load_debug_trajectory(
+        self,
+        take_dir: str,
+        episode_id: str,
+        take: str,
+        source: str = "teach",
+    ) -> dict:
+        if source not in {"teach", "command"}:
+            return {"ok": False, "reason": "source must be teach or command"}
+        if self.get_state() not in self._debug_idle_states():
+            return {"ok": False, "reason": f"Robot is busy in {self.get_state().value}"}
+        with self._debug_lock:
+            if self._debug_operation:
+                return {"ok": False, "reason": "A debug motion is already running"}
+
+        filename = "teach_joint.csv" if source == "teach" else "replay_command.csv"
+        path = os.path.join(take_dir, filename)
+        if not os.path.isfile(path):
+            return {"ok": False, "reason": f"Missing {filename}"}
+
+        rows: list[dict] = []
+        try:
+            with open(path, newline="") as file:
+                for raw in csv.DictReader(file):
+                    q = [float(raw[f"q{i}"]) for i in range(1, 7)]
+                    if not all(np.isfinite(value) for value in q):
+                        continue
+                    row = {f"q{i+1}": q[i] for i in range(6)}
+                    row["t_host_ns"] = int(float(raw.get("t_host_ns", 0)))
+                    gripper = raw.get("gripper")
+                    row["gripper"] = (
+                        float(gripper)
+                        if gripper not in (None, "") and np.isfinite(float(gripper))
+                        else None
+                    )
+                    rows.append(row)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            return {"ok": False, "reason": f"Failed to read trajectory: {exc}"}
+        if len(rows) < 10:
+            return {"ok": False, "reason": f"Trajectory too short ({len(rows)} samples)"}
+
+        if source == "teach":
+            trajectory, check = PiperTeachReplayNode.smooth_trajectory(rows, REPLAY_DEFAULT_SPEED)
+        else:
+            trajectory = rows
+            q = np.array([[row[f"q{i}"] for i in range(1, 7)] for row in rows])
+            max_velocity = float(np.max(np.abs(np.diff(q, axis=0))) * 50.0)
+            check = {
+                "ok": True,
+                "samples": len(rows),
+                "duration_s": round((len(rows) - 1) / 50.0, 2),
+                "max_joint_velocity_rad_s": round(max_velocity, 4),
+                "velocity_limit_ok": max_velocity <= MAX_JOINT_VELOCITY_RAD_S,
+                "source": "replay_command.csv",
+            }
+
+        if not trajectory or not all(
+            np.isfinite(row.get(f"q{i}", float("nan")))
+            for row in trajectory for i in range(1, 7)
+        ):
+            return {"ok": False, "reason": "Trajectory contains invalid joint values"}
+
+        with self._debug_lock:
+            self._debug_trajectory = trajectory
+            self._debug_source = {
+                "episode_id": episode_id,
+                "take": take,
+                "source": source,
+                "filename": filename,
+                "samples": len(trajectory),
+                "take_dir": take_dir,
+            }
+            self._debug_check = check
+            self._debug_start_ready = False
+            self._debug_last_error = ""
+            self._debug_last_diagnostics = {}
+        self._add_event_log(
+            f"Debug trajectory loaded: {episode_id}/{take}/{filename} ({len(trajectory)} samples)"
+        )
+        return self.get_debug_replay_status()
+
+    def _restore_after_debug_operation(self, expected: str) -> None:
+        with self._debug_lock:
+            if self._debug_operation != expected:
+                return
+            previous = self._debug_previous_state or State.READY
+            self._debug_operation = None
+            self._debug_previous_state = None
+        self._set_state(previous)
+
+    def return_debug_replay_to_start(self) -> dict:
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+        state = self.get_state()
+        if state not in self._debug_idle_states() or state == State.IDLE:
+            return {"ok": False, "reason": f"Robot is not ready in {state.value}"}
+        with self._debug_lock:
+            if not self._debug_trajectory:
+                return {"ok": False, "reason": "Load a debug trajectory first"}
+            if self._debug_operation:
+                return {"ok": False, "reason": "A debug motion is already running"}
+            target = [self._debug_trajectory[0][f"q{i}"] for i in range(1, 7)]
+            self._debug_operation = "return"
+            self._debug_previous_state = state
+            self._debug_start_ready = False
+            self._debug_last_error = ""
+
+        self._set_state(State.DEBUG_RETURN)
+
+        def done():
+            with self._debug_lock:
+                self._debug_start_ready = True
+            self._add_event_log("Debug replay start pose reached")
+            self._restore_after_debug_operation("return")
+
+        def abort():
+            with self._debug_lock:
+                self._debug_last_error = self._piper._last_transition_error or "Return to start failed"
+            self._restore_after_debug_operation("return")
+
+        started = self._piper.go_to_safe_ready(
+            final_position=target,
+            done_callback=done,
+            abort_callback=abort,
+        )
+        if not started:
+            with self._debug_lock:
+                self._debug_last_error = self._piper._last_transition_error or "Return to start refused"
+            self._restore_after_debug_operation("return")
+            return {"ok": False, "reason": self._debug_last_error}
+        return {"ok": True, "operation": "return"}
+
+    def _allocate_debug_run_dir(self) -> str:
+        take_dir = str(self._debug_source["take_dir"])
+        root = os.path.join(take_dir, "debug_replays")
+        os.makedirs(root, exist_ok=True)
+        numbers = []
+        for name in os.listdir(root):
+            if name.startswith("run_") and name[4:].isdigit():
+                numbers.append(int(name[4:]))
+        path = os.path.join(root, f"run_{max(numbers, default=0) + 1:03d}")
+        os.makedirs(path, exist_ok=False)
+        return path
+
+    @staticmethod
+    def _write_debug_csv(path: str, rows: list[dict], fields: list[str]) -> None:
+        with open(path, "w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _debug_diagnostics(
+        command: list[dict], executed: list[dict], worker: Optional[dict] = None
+    ) -> dict:
+        result: dict = {
+            "command_samples": len(command),
+            "executed_samples": len(executed),
+        }
+        if worker:
+            started = worker.get("started_at")
+            finished = worker.get("finished_at")
+            if started is not None and finished is not None:
+                result["duration_s"] = round(float(finished) - float(started), 3)
+            result["gripper_timing"] = [
+                {
+                    "source_idx": event.get("source_idx"),
+                    "hold_to_converged_ms": round(
+                        (int(event.get("converged_t_host_ns", 0))
+                         - int(event.get("hold_started_t_host_ns", 0))) * 1e-6, 3
+                    ),
+                    "gripper_motion_ms": round(
+                        (int(event.get("gripper_finished_t_host_ns", 0))
+                         - int(event.get("converged_t_host_ns", 0))) * 1e-6, 3
+                    ),
+                    "resume_ramp_ms": round(
+                        (int(event.get("resume_finished_t_host_ns", 0))
+                         - int(event.get("resume_started_t_host_ns", 0))) * 1e-6, 3
+                    ),
+                }
+                for event in worker.get("gripper_events", [])
+            ]
+        if command:
+            result["max_lateness_ms"] = round(max(float(row.get("lateness_ms", 0.0)) for row in command), 3)
+            indices = [float(row.get("source_idx", 0.0)) for row in command]
+            result["max_source_step"] = round(
+                max((indices[i+1] - indices[i] for i in range(len(indices)-1)), default=0.0), 4
+            )
+        if len(command) > 1:
+            command_times = np.array([int(row["t_host_ns"]) for row in command], dtype=np.int64)
+            command_gaps = np.diff(command_times) * 1e-6
+            pause_ranges = [
+                (
+                    int(event.get("hold_started_t_host_ns", 0)),
+                    int(
+                        event.get("resume_started_t_host_ns")
+                        or event.get("resume_finished_t_host_ns", 0)
+                    ),
+                )
+                for event in (worker or {}).get("gripper_events", [])
+            ]
+            motion_gaps = [
+                float(gap) for index, gap in enumerate(command_gaps)
+                if not any(
+                    int(command_times[index]) <= start
+                    and int(command_times[index + 1]) >= finish
+                    for start, finish in pause_ranges if start and finish
+                )
+            ]
+            result["command_gap_max_ms"] = round(max(motion_gaps, default=0.0), 3)
+            result["command_gap_p95_ms"] = round(
+                float(np.percentile(motion_gaps, 95)) if motion_gaps else 0.0, 3
+            )
+            result["command_gaps_over_50ms"] = sum(gap > 50.0 for gap in motion_gaps)
+            result["gripper_pause_count"] = len(pause_ranges)
+        if len(executed) > 1:
+            times = np.array([int(row["t_host_ns"]) for row in executed], dtype=np.int64)
+            gaps = np.diff(times) * 1e-6
+            result["feedback_gap_max_ms"] = round(float(np.max(gaps)), 3)
+            result["feedback_gaps_over_50ms"] = int(np.sum(gaps > 50.0))
+        if len(command) > 1 and executed:
+            cmd_t = np.array([int(row["t_host_ns"]) for row in command], dtype=np.float64)
+            exec_rows = [row for row in executed if cmd_t[0] <= int(row["t_host_ns"]) <= cmd_t[-1]]
+            if exec_rows:
+                exec_t = np.array([int(row["t_host_ns"]) for row in exec_rows], dtype=np.float64)
+                errors = []
+                for joint in range(1, 7):
+                    cmd_q = np.array([float(row[f"q{joint}"]) for row in command])
+                    exec_q = np.array([float(row[f"q{joint}"]) for row in exec_rows])
+                    errors.append(np.abs(exec_q - np.interp(exec_t, cmd_t, cmd_q)))
+                err = np.stack(errors, axis=1)
+                result["tracking_error_mean_rad"] = np.mean(err, axis=0).round(5).tolist()
+                result["tracking_error_max_rad"] = np.max(err, axis=0).round(5).tolist()
+        return result
+
+    def _finalize_debug_replay(self) -> None:
+        with self._debug_lock:
+            if self._debug_operation != "replay":
+                return
+            # Atomically claim finalization so Stop and the worker callback
+            # cannot both flush/restore the same debug run.
+            self._debug_operation = "replay_finalizing"
+            run_dir = self._debug_run_dir
+            stopped = self._debug_stop_requested
+            source = {key: value for key, value in self._debug_source.items() if key != "take_dir"}
+            started_at = self._debug_started_at
+            speed = self._debug_speed
+        command = self._piper.get_command_buffer() if self._piper else []
+        executed = self._piper.get_executed_buffer() if self._piper else []
+        worker_result = (
+            self._piper.get_replay_worker_status().get("result", {})
+            if self._piper else {}
+        )
+        diagnostics = self._debug_diagnostics(command, executed, worker_result)
+        last_source_idx = float(command[-1].get("source_idx", -1.0)) if command else -1.0
+        expected_last_idx = max(0, len(self._debug_trajectory) - 1)
+        completed = bool(
+            not stopped
+            and worker_result.get("ok", command and last_source_idx >= expected_last_idx - 1e-3)
+        )
+        diagnostics.update({
+            "completed": completed,
+            "stopped_by_user": stopped,
+            "speed_scale": speed,
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(),
+            "source": source,
+            "trajectory_check": self._debug_check,
+            "worker": worker_result,
+        })
+        try:
+            if run_dir:
+                joint_fields = ["t_host_ns"] + [f"q{i}" for i in range(1, 7)] + [f"dq{i}" for i in range(1, 7)] + ["gripper", "mode"]
+                command_fields = ["t_host_ns", "scheduled_t_host_ns", "waypoint_idx", "source_idx", "lateness_ms", "velocity"] + [f"q{i}" for i in range(1, 7)] + ["gripper", "gripper_effort"]
+                self._write_debug_csv(os.path.join(run_dir, "executed_joint.csv"), executed, joint_fields)
+                self._write_debug_csv(os.path.join(run_dir, "replay_command.csv"), command, command_fields)
+                with open(os.path.join(run_dir, "diagnostics.json"), "w") as file:
+                    json.dump(diagnostics, file, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            diagnostics["save_error"] = str(exc)
+            with self._debug_lock:
+                self._debug_last_error = f"Debug result save failed: {exc}"
+        with self._debug_lock:
+            self._debug_last_diagnostics = diagnostics
+            self._debug_start_ready = False
+        self._add_event_log(
+            f"Debug replay {'stopped' if stopped else 'completed'}: "
+            f"cmd={len(command)} exec={len(executed)}"
+        )
+        self._restore_after_debug_operation("replay_finalizing")
+
+    def start_debug_replay(self, speed_scale: float = 0.5) -> dict:
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+        state = self.get_state()
+        if state not in self._debug_idle_states() or state == State.IDLE:
+            return {"ok": False, "reason": f"Robot is not ready in {state.value}"}
+        try:
+            speed = float(speed_scale)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "Invalid speed"}
+        if speed not in {0.3, 0.5, 0.7}:
+            return {"ok": False, "reason": "Debug speed must be 0.3, 0.5, or 0.7"}
+
+        with self._debug_lock:
+            if not self._debug_trajectory:
+                return {"ok": False, "reason": "Load a debug trajectory first"}
+            if self._debug_operation:
+                return {"ok": False, "reason": "A debug motion is already running"}
+            q0 = [self._debug_trajectory[0][f"q{i}"] for i in range(1, 7)]
+            current = self._piper.get_state().get("position", [])
+            error = max(abs(float(current[i]) - q0[i]) for i in range(6)) if len(current) >= 6 else float("inf")
+            if not self._debug_start_ready or error > 0.06:
+                self._debug_start_ready = False
+                return {"ok": False, "reason": f"Return to start first (err={error:.4f}rad)"}
+            base_velocity = float(self._debug_check.get("max_joint_velocity_rad_s", 0.0) or 0.0)
+            if base_velocity * speed > MAX_JOINT_VELOCITY_RAD_S:
+                return {"ok": False, "reason": "Selected speed exceeds the joint velocity limit"}
+            try:
+                run_dir = self._allocate_debug_run_dir()
+            except OSError as exc:
+                return {"ok": False, "reason": f"Could not create debug run: {exc}"}
+            self._debug_operation = "replay"
+            self._debug_previous_state = state
+            self._debug_run_dir = run_dir
+            self._debug_started_at = datetime.now().isoformat()
+            self._debug_speed = speed
+            self._debug_stop_requested = False
+            self._debug_last_error = ""
+            trajectory = list(self._debug_trajectory)
+
+        self._set_state(State.DEBUG_REPLAY)
+        started = self._piper.start_replay(
+            trajectory,
+            speed_scale=speed,
+            done_callback=self._finalize_debug_replay,
+        )
+        if not started:
+            with self._debug_lock:
+                self._debug_last_error = self._piper._last_transition_error or "Debug replay start failed"
+            self._restore_after_debug_operation("replay")
+            return {"ok": False, "reason": self._debug_last_error}
+        self._add_event_log(f"Debug replay started without recording (speed={speed:.0%})")
+        return {"ok": True, "run": os.path.basename(run_dir)}
+
+    def stop_debug_replay(self) -> dict:
+        with self._debug_lock:
+            sequence_active = bool(self._debug_sequence and self._debug_sequence.get("active"))
+            if sequence_active:
+                self._debug_sequence["cancelled"] = True
+            elif self._debug_operation != "replay":
+                return {"ok": False, "reason": "No debug replay is running"}
+            self._debug_stop_requested = True
+        if sequence_active:
+            if self._piper:
+                self._piper.hold_position()
+            self._finish_debug_sequence("stopped by user")
+            return {"ok": True, "stopping": True, "sequence": True}
+        if self._piper:
+            # The worker owns the command CSV and completion signal.  Join it
+            # here (with PiperNode's terminate/kill fallback) so a subsequent
+            # Return request cannot remain blocked by stale "replay" state.
+            self._piper.stop_replay()
+        self._finalize_debug_replay()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with self._debug_lock:
+                if self._debug_operation is None:
+                    break
+            time.sleep(0.01)
+        with self._debug_lock:
+            if self._debug_operation is not None:
+                return {
+                    "ok": False,
+                    "reason": "Replay stopped, but debug state cleanup timed out",
+                }
+        return {"ok": True, "stopping": True}
+
+    def start_debug_sequence(self, items: list[dict], cycles=1, speed_scale=0.3) -> dict:
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+        state = self.get_state()
+        if state not in self._debug_idle_states() or state == State.IDLE:
+            return {"ok": False, "reason": f"Robot is not ready in {state.value}"}
+        try:
+            cycle_count = int(cycles)
+            speed = float(speed_scale)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "Invalid cycles or speed"}
+        if not 1 <= cycle_count <= 5:
+            return {"ok": False, "reason": "cycles must be between 1 and 5"}
+        if speed not in {0.3, 0.5, 0.7}:
+            return {"ok": False, "reason": "speed_scale must be 0.3, 0.5, or 0.7"}
+        if len(items) != 2:
+            return {"ok": False, "reason": "A/B sequence requires exactly two items"}
+        with self._debug_lock:
+            if self._debug_operation or (
+                self._debug_sequence and self._debug_sequence.get("active")
+            ):
+                return {"ok": False, "reason": "A debug motion is already running"}
+
+        saved = (
+            list(self._debug_trajectory), dict(self._debug_source), dict(self._debug_check)
+        )
+        entries = []
+        for label, item in zip(("A", "B"), items):
+            result = self.load_debug_trajectory(
+                take_dir=item["take_dir"],
+                episode_id=item["episode_id"],
+                take=item["take"],
+                source=item.get("source", "teach"),
+            )
+            if not result.get("ok"):
+                with self._debug_lock:
+                    self._debug_trajectory, self._debug_source, self._debug_check = saved
+                return {"ok": False, "reason": f"{label}: {result.get('reason', 'load failed')}"}
+            with self._debug_lock:
+                entries.append({
+                    "label": label,
+                    "trajectory": list(self._debug_trajectory),
+                    "source": dict(self._debug_source),
+                    "check": dict(self._debug_check),
+                })
+
+        sequence_id = datetime.now().strftime("sequence_%Y%m%d_%H%M%S")
+        root = os.path.join(DATASET_PATH, "debug_sequences", sequence_id)
+        try:
+            os.makedirs(root, exist_ok=False)
+            manifest = {
+                "sequence_id": sequence_id,
+                "cycles": cycle_count,
+                "speed_scale": speed,
+                "items": [
+                    {key: value for key, value in entry["source"].items() if key != "take_dir"}
+                    for entry in entries
+                ],
+                "started_at": datetime.now().isoformat(),
+            }
+            with open(os.path.join(root, "manifest.json"), "w") as file:
+                json.dump(manifest, file, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            return {"ok": False, "reason": f"Could not create sequence output: {exc}"}
+
+        with self._debug_lock:
+            self._debug_sequence = {
+                "active": True,
+                "cancelled": False,
+                "sequence_id": sequence_id,
+                "root": root,
+                "cycles": cycle_count,
+                "cycle": 1,
+                "item_index": 0,
+                "label": "A",
+                "phase": "RETURN",
+                "speed_scale": speed,
+                "completed_replays": 0,
+                "total_replays": cycle_count * 2,
+                "results": [],
+                "entries": entries,
+                "previous_state": state,
+                "started_at": datetime.now().isoformat(),
+            }
+            self._debug_last_error = ""
+            self._debug_operation = "sequence_return"
+        self._add_event_log(
+            f"Debug A/B sequence started: {sequence_id}, cycles={cycle_count}, speed={speed:.0%}"
+        )
+        self._begin_debug_sequence_item()
+        with self._debug_lock:
+            if not self._debug_sequence or not self._debug_sequence.get("active"):
+                return {
+                    "ok": False,
+                    "reason": self._debug_last_error or "Sequence start failed",
+                }
+        return {"ok": True, "sequence_id": sequence_id, "total_replays": cycle_count * 2}
+
+    def _begin_debug_sequence_item(self):
+        with self._debug_lock:
+            sequence = self._debug_sequence
+            if not sequence or not sequence.get("active") or sequence.get("cancelled"):
+                return
+            entry = sequence["entries"][sequence["item_index"]]
+            sequence["label"] = entry["label"]
+            sequence["phase"] = "RETURN"
+            self._debug_operation = "sequence_return"
+            self._debug_trajectory = list(entry["trajectory"])
+            self._debug_source = dict(entry["source"])
+            self._debug_check = dict(entry["check"])
+            self._debug_start_ready = False
+            target = [self._debug_trajectory[0][f"q{i}"] for i in range(1, 7)]
+        self._set_state(State.DEBUG_RETURN)
+        started = self._piper.go_to_safe_ready(
+            final_position=target,
+            done_callback=self._debug_sequence_return_done,
+            abort_callback=self._debug_sequence_return_abort,
+        )
+        if not started:
+            self._finish_debug_sequence(
+                self._piper._last_transition_error or "sequence return refused"
+            )
+
+    def _debug_sequence_return_done(self):
+        with self._debug_lock:
+            sequence = self._debug_sequence
+            if not sequence or not sequence.get("active") or sequence.get("cancelled"):
+                return
+            sequence["phase"] = "REPLAY"
+            self._debug_operation = "sequence_replay"
+            trajectory = list(self._debug_trajectory)
+            speed = float(sequence["speed_scale"])
+        self._set_state(State.DEBUG_REPLAY)
+        if not self._piper.start_replay(
+            trajectory, speed_scale=speed, done_callback=self._debug_sequence_replay_done
+        ):
+            self._finish_debug_sequence(
+                self._piper._last_transition_error or "sequence replay start failed"
+            )
+
+    def _debug_sequence_return_abort(self):
+        self._finish_debug_sequence(
+            self._piper._last_transition_error or "sequence return failed"
+        )
+
+    def _debug_sequence_replay_done(self):
+        with self._debug_lock:
+            sequence = self._debug_sequence
+            if not sequence or not sequence.get("active"):
+                return
+            cycle = int(sequence["cycle"])
+            label = str(sequence["label"])
+            source = {
+                key: value for key, value in self._debug_source.items() if key != "take_dir"
+            }
+            check = dict(self._debug_check)
+            output = os.path.join(sequence["root"], f"cycle_{cycle:03d}", label)
+        command = self._piper.get_command_buffer()
+        executed = self._piper.get_executed_buffer()
+        worker_result = self._piper.get_replay_worker_status().get("result", {})
+        diagnostics = self._debug_diagnostics(command, executed, worker_result)
+        diagnostics.update({
+            "source": source,
+            "trajectory_check": check,
+            "worker": worker_result,
+            "cycle": cycle,
+            "label": label,
+            "finished_at": datetime.now().isoformat(),
+            "completed": bool(worker_result.get("ok")),
+        })
+        try:
+            os.makedirs(output, exist_ok=False)
+            joint_fields = ["t_host_ns"] + [f"q{i}" for i in range(1, 7)] + [f"dq{i}" for i in range(1, 7)] + ["gripper", "mode"]
+            command_fields = ["t_host_ns", "scheduled_t_host_ns", "waypoint_idx", "source_idx", "lateness_ms", "velocity"] + [f"q{i}" for i in range(1, 7)] + ["gripper", "gripper_effort"]
+            self._write_debug_csv(os.path.join(output, "executed_joint.csv"), executed, joint_fields)
+            self._write_debug_csv(os.path.join(output, "replay_command.csv"), command, command_fields)
+            with open(os.path.join(output, "diagnostics.json"), "w") as file:
+                json.dump(diagnostics, file, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self._finish_debug_sequence(f"sequence result save failed: {exc}")
+            return
+
+        with self._debug_lock:
+            sequence = self._debug_sequence
+            if not sequence or not sequence.get("active"):
+                return
+            sequence["results"].append(diagnostics)
+            sequence["completed_replays"] += 1
+            failed = not worker_result.get("ok")
+            if not failed:
+                if sequence["item_index"] == 0:
+                    sequence["item_index"] = 1
+                else:
+                    sequence["item_index"] = 0
+                    sequence["cycle"] += 1
+                done = sequence["cycle"] > sequence["cycles"]
+            else:
+                done = False
+        if failed:
+            self._finish_debug_sequence(worker_result.get("error") or f"{label} replay failed")
+        elif done:
+            self._finish_debug_sequence("")
+        else:
+            self._begin_debug_sequence_item()
+
+    def _finish_debug_sequence(self, error: str):
+        with self._debug_lock:
+            sequence = self._debug_sequence
+            if not sequence or not sequence.get("active"):
+                return
+            sequence["active"] = False
+            sequence["phase"] = "FAILED" if error else "COMPLETED"
+            sequence["finished_at"] = datetime.now().isoformat()
+            sequence["error"] = error or None
+            summary = {
+                key: value for key, value in sequence.items()
+                if key not in {"entries", "root", "previous_state"}
+            }
+            by_label = {}
+            for label in ("A", "B"):
+                rows = [item for item in sequence["results"] if item.get("label") == label]
+                if not rows:
+                    continue
+                by_label[label] = {
+                    "runs": len(rows),
+                    "duration_s_mean": round(float(np.mean([
+                        float(item.get("worker", {}).get("finished_at", 0) or 0)
+                        - float(item.get("worker", {}).get("started_at", 0) or 0)
+                        for item in rows
+                    ])), 3),
+                    "command_gap_p95_ms_max": max(
+                        float(item.get("command_gap_p95_ms", 0.0)) for item in rows
+                    ),
+                    "command_gap_max_ms": max(
+                        float(item.get("command_gap_max_ms", 0.0)) for item in rows
+                    ),
+                    "feedback_gap_max_ms": max(
+                        float(item.get("feedback_gap_max_ms", 0.0)) for item in rows
+                    ),
+                    "tracking_error_max_rad": [
+                        max(
+                            float(item.get("tracking_error_max_rad", [0.0] * 6)[joint])
+                            for item in rows
+                        ) for joint in range(6)
+                    ],
+                    "gripper_pause_count": sum(
+                        int(item.get("gripper_pause_count", 0)) for item in rows
+                    ),
+                    "gripper_timing": [
+                        timing
+                        for item in rows
+                        for timing in item.get("gripper_timing", [])
+                    ],
+                }
+            summary["episodes"] = by_label
+            if "A" in by_label and "B" in by_label:
+                summary["ab_difference"] = {
+                    "duration_s_mean_B_minus_A": round(
+                        by_label["B"]["duration_s_mean"]
+                        - by_label["A"]["duration_s_mean"], 3
+                    ),
+                    "command_gap_p95_ms_B_minus_A": round(
+                        by_label["B"]["command_gap_p95_ms_max"]
+                        - by_label["A"]["command_gap_p95_ms_max"], 3
+                    ),
+                    "feedback_gap_max_ms_B_minus_A": round(
+                        by_label["B"]["feedback_gap_max_ms"]
+                        - by_label["A"]["feedback_gap_max_ms"], 3
+                    ),
+                    "tracking_error_max_rad_B_minus_A": [
+                        round(
+                            by_label["B"]["tracking_error_max_rad"][joint]
+                            - by_label["A"]["tracking_error_max_rad"][joint], 5
+                        ) for joint in range(6)
+                    ],
+                }
+            root = sequence["root"]
+            previous = sequence["previous_state"]
+            self._debug_operation = None
+            self._debug_previous_state = None
+            self._debug_last_error = error
+            self._debug_last_diagnostics = (
+                sequence["results"][-1] if sequence["results"] else {}
+            )
+        try:
+            with open(os.path.join(root, "summary.json"), "w") as file:
+                json.dump(summary, file, ensure_ascii=False, indent=2, default=str)
+        except OSError as exc:
+            with self._debug_lock:
+                self._debug_last_error = error or f"sequence summary save failed: {exc}"
+        self._set_state(previous)
+        self._add_event_log(
+            f"Debug A/B sequence {'failed: ' + error if error else 'completed'}"
+        )
+
+    # ─────────────────────────────────────────────────────────────────
     # Safety / gripper
     # ─────────────────────────────────────────────────────────────────
 
     def hold_position(self) -> dict:
         """Soft stop: 현재 position hold"""
         if self._piper:
-            self._piper.hold_position()
+            if not self._piper.hold_position():
+                return {"ok": False, "reason": self._piper._last_transition_error}
             self._add_event_log("HOLD POSITION (soft stop)")
+        with self._debug_lock:
+            debug_operation = self._debug_operation
+            sequence_active = bool(self._debug_sequence and self._debug_sequence.get("active"))
+            if debug_operation == "return":
+                self._debug_start_ready = False
+                self._debug_last_error = "Debug return stopped by Hold"
+            elif debug_operation == "replay":
+                self._debug_stop_requested = True
+            elif sequence_active:
+                self._debug_sequence["cancelled"] = True
+        if debug_operation == "return":
+            self._restore_after_debug_operation("return")
+        elif sequence_active:
+            self._finish_debug_sequence("stopped by Hold")
         return {"ok": True}
 
     def motors_enable(self) -> dict:
         """모터 활성화 (Advanced joint control 용)"""
         if self._piper is None:
             return {"ok": False, "reason": "Robot not connected"}
-        self._piper.enable_motors()
+        self._piper._cancel_pending_mode_timers()
+        if not self._piper.enable_motors():
+            return {"ok": False, "reason": self._piper._last_transition_error}
         self._add_event_log("Motors enabled (manual)")
         return {"ok": True}
+
+    def motors_recover(self, confirmed: bool = False) -> dict:
+        """Operator-confirmed recovery for a latched motor safety fault."""
+        if not confirmed:
+            return {
+                "ok": False,
+                "reason": "Operator confirmation is required before motor recovery",
+            }
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+        result = self._piper.recover_motors()
+        if result.get("ok"):
+            self._add_event_log("Motor safety fault recovered at current pose")
+        else:
+            self._add_event_log(
+                f"Motor safety recovery failed: {result.get('reason', 'unknown')}"
+            )
+        return result
 
     def motors_disable(self) -> dict:
         """모터 비활성화 / freedrive (Advanced joint control 용)"""
         if self._piper is None:
             return {"ok": False, "reason": "Robot not connected"}
-        self._piper.disable_motors()
+        self._piper._cancel_pending_mode_timers()
+        if not self._piper.disable_motors():
+            return {"ok": False, "reason": self._piper._last_transition_error}
         self._add_event_log("Motors disabled / freedrive (manual)")
         return {"ok": True}
 
@@ -716,9 +1729,12 @@ class Controller:
                 return
             with open(JOINT_LIMITS_FILE) as f:
                 limits = json.load(f)
-            if self._piper:
-                self._piper.set_pm_joint_limits(limits)
-            self._add_event_log(f"Joint limits loaded from {JOINT_LIMITS_FILE}")
+            if self._piper and self._piper.set_pm_joint_limits(limits):
+                self._add_event_log(f"Joint limits loaded from {JOINT_LIMITS_FILE}")
+            else:
+                self._add_event_log(
+                    f"Rejected invalid joint limits from {JOINT_LIMITS_FILE}; defaults preserved"
+                )
         except Exception as e:
             self._add_event_log(f"Failed to load joint limits: {e}")
 
@@ -730,7 +1746,8 @@ class Controller:
         if self._piper is None:
             return {"ok": False, "reason": "Robot not connected"}
         self._calib_prev_state = state
-        self._piper.start_calib()
+        if not self._piper.start_calib():
+            return {"ok": False, "reason": self._piper._last_transition_error}
         self._set_state(State.CALIBRATING)
         self._add_event_log("Calibration started — move arm through full ROM")
         return {"ok": True}
@@ -742,10 +1759,17 @@ class Controller:
         if self._piper is None:
             return {"ok": False, "reason": "Robot not connected"}
 
-        limits = self._piper.stop_calib()
+        result = self._piper.stop_calib()
+        if not result.get("ok"):
+            self._set_state(self._calib_prev_state)
+            self._add_event_log(f"Calibration rejected: {result.get('reason', 'invalid range')}")
+            return result
+        limits = result["limits"]
 
         # piper node에 즉시 적용
-        self._piper.set_pm_joint_limits(limits)
+        if not self._piper.set_pm_joint_limits(limits):
+            self._set_state(self._calib_prev_state)
+            return {"ok": False, "reason": "Validated calibration could not be applied"}
 
         # JSON 저장
         try:
@@ -761,6 +1785,17 @@ class Controller:
         self._add_event_log(f"Calibration done — measured: {measured}")
         return {"ok": True, "limits": limits}
 
+    def resume_calibration(self) -> dict:
+        """CALIBRATING 중 HOLD를 해제하고 기존 min/max 추적을 계속한다."""
+        if self.get_state() != State.CALIBRATING:
+            return {"ok": False, "reason": "Not in CALIBRATING state"}
+        if self._piper is None:
+            return {"ok": False, "reason": "Robot not connected"}
+        if not self._piper.resume_calib():
+            return {"ok": False, "reason": self._piper._last_transition_error}
+        self._add_event_log("Calibration resumed — motors released, measured range preserved")
+        return {"ok": True}
+
     def enable_phone_mouse(self) -> dict:
         """
         Phone Mouse 모드 진입 시 호출.
@@ -768,11 +1803,13 @@ class Controller:
         - 즉시 teach recording 시작 (motors ON 유지)
         TEACH_RECORDING 상태에서만 유효.
         """
-        if self.get_state() != State.TEACH_RECORDING:
-            return {"ok": False, "reason": "Not in TEACH_RECORDING state"}
+        if self.get_state() not in (State.TEACH_STARTING, State.TEACH_RECORDING):
+            return {"ok": False, "reason": "Not in a teach start/recording state"}
         if self._piper is None:
             return {"ok": False, "reason": "Robot not connected"}
-        self._piper.begin_teach_recording()
+        if not self._piper.begin_teach_recording():
+            return {"ok": False, "reason": self._piper._last_transition_error}
+        self._set_state(State.TEACH_RECORDING)
         self._add_event_log("Phone Mouse enabled — recording started (motors ON)")
         return {"ok": True}
 
@@ -860,6 +1897,7 @@ class Controller:
     # ─────────────────────────────────────────────────────────────────
 
     def get_diagnostics(self) -> dict:
+        robot = self._piper.get_state() if self._piper else {}
         return {
             "state": self.get_state().value,
             "piper_connected": self._piper is not None,
@@ -869,6 +1907,24 @@ class Controller:
             "trajectory_check": self._trajectory_check,
             "episode_id": self._episode.current_episode_id,
             "event_log_len": len(self._event_log),
+            "gripper_responsive": robot.get("gripper_responsive"),
+            "motor_enable_status": robot.get("motor_enable_status", []),
+            "motor_fault_codes": robot.get("motor_fault_codes", []),
+            "motor_faults": robot.get("motor_faults", []),
+            "arm_status": robot.get("arm_status", {}),
+            "motor_status_age_s": robot.get("motor_status_age_s"),
+            "joint_feedback_age_s": robot.get("feedback_age_s"),
+            "transition_state": robot.get("transition_state"),
+            "transition_error": robot.get("transition_error"),
+            "safety_latched": robot.get("safety_latched", False),
+            "safety_reason": robot.get("safety_reason"),
+            "can_healthy": robot.get("can_healthy", True),
+            "abort_class": robot.get("abort_class"),
+            "last_motion_abort": robot.get("last_motion_abort", {}),
+            "recovery": robot.get("recovery", {}),
+            "calibration_span": robot.get("calibration_span", []),
+            "calibration_valid": robot.get("calibration_valid", []),
+            "debug_replay": self.get_debug_replay_status(),
         }
 
     # ─────────────────────────────────────────────────────────────────

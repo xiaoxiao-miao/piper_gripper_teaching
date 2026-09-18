@@ -12,3 +12,4 @@ imageio-ffmpeg
 pillow
 cryptography
 pyrealsense2
+numpy<2.0  # PySpin(Spinnaker SDK) native extension은 numpy 1.x ABI로 빌드됨

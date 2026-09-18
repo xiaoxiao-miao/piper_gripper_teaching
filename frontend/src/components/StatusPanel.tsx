@@ -2,7 +2,7 @@ import React, { useMemo } from "react";
 import type { AppMode, RobotState, CameraState, LoggerState, EventLog } from "../types";
 
 interface Props {
-  page?: "capture" | "dataset" | "diagnostics" | "setup";
+  page?: "capture" | "dataset" | "screenshots" | "diagnostics" | "setup";
   mode: AppMode;
   robot: RobotState;
   camera: CameraState;

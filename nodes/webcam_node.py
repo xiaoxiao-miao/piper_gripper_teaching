@@ -30,7 +30,7 @@ except ImportError:
     COLOR_SAVE_JPEG_QUALITY = 85
 
 WRITER_QUEUE_MAX = 150   # ~5초 @30fps
-TARGET_RESOLUTIONS = [(960, 720), (640, 480)]  # 우선순위 순
+TARGET_RESOLUTIONS = [(480, 360), (640, 480)]  # 우선순위 순
 
 
 @dataclass
@@ -64,6 +64,10 @@ class WebcamCapture:
         # live frame (MJPEG 스트리밍용)
         self._latest_frame: Optional[WebcamFrame] = None
         self._frame_lock = threading.Lock()
+        self._jpeg_lock = threading.Lock()
+        self._jpeg_cache_t_ns = 0
+        self._jpeg_cache_quality = -1
+        self._jpeg_cache: Optional[bytes] = None
         self._live_fps = 0.0
         self._live_count = 0
         self._live_hz_t = time.time()
@@ -99,6 +103,9 @@ class WebcamCapture:
             print(f"[{self.name}] Cannot open {self.device_path}")
             return False
 
+        # MJPEG으로 전환 — USB 허브 대역폭 절약 (YUYV 대비 10~20배 압축)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
+
         # 해상도 협상
         opened_res = None
         for w, h in TARGET_RESOLUTIONS:
@@ -117,10 +124,16 @@ class WebcamCapture:
 
         cap.set(cv2.CAP_PROP_FPS, self._target_fps)
 
-        # 테스트 프레임
-        ret, _ = cap.read()
+        # USB 재연결/전원 복귀 직후 첫 프레임이 비는 장치가 있으므로 짧게 warm-up.
+        # 한 번의 read 실패만으로 연결된 카메라를 영구 skip하지 않는다.
+        ret = False
+        for _ in range(10):
+            ret, _ = cap.read()
+            if ret:
+                break
+            time.sleep(0.05)
         if not ret:
-            print(f"[{self.name}] Test frame read failed — device unusable")
+            print(f"[{self.name}] Test frame read failed after warm-up — device unusable")
             cap.release()
             return False
 
@@ -248,8 +261,24 @@ class WebcamCapture:
             frame = self._latest_frame
         if frame is None:
             return None
-        ok, buf = cv2.imencode(".jpg", frame.rgb, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        return bytes(buf) if ok else None
+        # Multiple MJPEG clients often request the same 15fps source frame at 30fps.
+        # Encode it once instead of competing with the replay scheduler for every client.
+        with self._jpeg_lock:
+            if (
+                self._jpeg_cache is not None
+                and self._jpeg_cache_t_ns == frame.t_host_ns
+                and self._jpeg_cache_quality == quality
+            ):
+                return self._jpeg_cache
+            ok, buf = cv2.imencode(
+                ".jpg", frame.rgb, [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+            if not ok:
+                return None
+            self._jpeg_cache = bytes(buf)
+            self._jpeg_cache_t_ns = frame.t_host_ns
+            self._jpeg_cache_quality = quality
+            return self._jpeg_cache
 
     # ─────────────────────────────────────────────────────────────────
     # Status

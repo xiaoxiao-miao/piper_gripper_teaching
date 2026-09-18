@@ -9,6 +9,7 @@ interface Props {
 const PAGE_LINKS: { page: Page; label: string }[] = [
   { page: "capture", label: "Capture" },
   { page: "dataset", label: "Dataset" },
+  { page: "screenshots", label: "📷 Screenshots" },
   { page: "setup", label: "System Setup" },
   { page: "diagnostics", label: "Diagnostics" },
 ];

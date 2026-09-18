@@ -45,6 +45,15 @@ export default function DiagnosticsPage({ devMode, robot, camera }: Props) {
               <KV k="Hz" v={String(robot.hz ?? "—")} />
               <KV k="Mode" v={robot.mode ?? "—"} />
               <KV k="is_moving" v={String(robot.is_moving ?? "—")} />
+              <KV k="Transition" v={String(robot.transition_state ?? "—")} />
+              <KV k="Motor enable" v={(robot.motor_enable_status ?? []).map(v => v ? "1" : "0").join(",") || "—"} />
+              <KV k="Feedback age" v={robot.feedback_age_s == null ? "—" : `${robot.feedback_age_s.toFixed(3)} s`} />
+              <KV k="Transition error" v={String(robot.transition_error ?? "—")} />
+              <KV k="Safety state" v={String(robot.abort_class ?? "READY")} />
+              <KV k="Safety latched" v={String(robot.safety_latched ?? false)} />
+              <KV k="Safety reason" v={String(robot.safety_reason ?? "—")} />
+              <KV k="CAN healthy" v={String(robot.can_healthy ?? "—")} />
+              <KV k="Motor faults" v={(robot.motor_fault_codes ?? []).map((v, i) => `J${i + 1}=0x${(v & ~(1 << 6)).toString(16)}`).join(", ") || "—"} />
               {(robot.position ?? []).map((v, i) => (
                 <KV key={i} k={`q${i + 1}`} v={v.toFixed(6)} />
               ))}

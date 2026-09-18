@@ -9,10 +9,15 @@
  */
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
-import type { AppMode, ModeChangePayload, RobotState, LoggerState } from "../types";
+import type { AppMode, ModeChangePayload, RobotState, LoggerState, CameraState } from "../types";
+import SafetyBanner from "../components/SafetyBanner";
 
-// Flask 서버 직접 연결 (모바일에서도 실제 IP로 접속)
-const FLASK_ORIGIN = `http://${window.location.hostname}:5002`;
+// Production mobile UI is served by Flask on :5002 or HTTPS :5003. Keep
+// Socket.IO on the page origin to avoid mixed-content blocking on HTTPS.
+// React's development server still connects directly to the Flask port.
+const FLASK_ORIGIN = window.location.port === "3000"
+  ? `http://${window.location.hostname}:5002`
+  : window.location.origin;
 
 // ── 타입 ─────────────────────────────────────────────────────────────
 
@@ -24,6 +29,7 @@ export default function MobileApp() {
   const [mode, setMode] = useState<AppMode>("IDLE");
   const [actions, setActions] = useState<string[]>([]);
   const [robot, setRobot] = useState<RobotState>({ connected: false });
+  const [camera, setCamera] = useState<CameraState>({ available: false });
   const [logger, setLogger] = useState<LoggerState>({});
 
   // Teaching mode (TEACH_READY에서 선택, TEACH_RECORDING에서 고정)
@@ -31,6 +37,8 @@ export default function MobileApp() {
 
   // Replay speed
   const [speedScale, setSpeedScale] = useState(0.5);
+  const [replayStarting, setReplayStarting] = useState(false);
+  const [replayMessage, setReplayMessage] = useState("");
 
   // Freedrive
   const [motorsFree, setMotorsFree] = useState(false);
@@ -74,7 +82,7 @@ export default function MobileApp() {
       setActions(data.available_actions);
 
       // TEACH_RECORDING 이탈 시 phone mouse 정리
-      if (data.mode !== "TEACH_RECORDING") {
+      if (data.mode !== "TEACH_RECORDING" && data.mode !== "TEACH_STARTING") {
         setPmActive(false);
         pmDeadmanRef.current = false;
         setPmDeadman(false);
@@ -89,6 +97,7 @@ export default function MobileApp() {
 
     s.on("robot_state", (data: RobotState) => setRobot(data));
     s.on("logger_state", (data: LoggerState) => setLogger(data));
+    s.on("camera_state", (data: CameraState) => setCamera(data));
 
     return () => {
       s.disconnect();
@@ -102,10 +111,12 @@ export default function MobileApp() {
     const t = setTimeout(() => {
       const next = disableCountdown - 1;
       if (next === 0) {
-        fetch("/api/robot/motors/disable", { method: "POST" }).then(() => {
-          setMotorsFree(true);
-          setDisableCountdown(0);
-        });
+        fetch("/api/robot/motors/disable", { method: "POST" })
+          .then(r => r.json())
+          .then(data => {
+            setMotorsFree(Boolean(data.ok));
+            setDisableCountdown(0);
+          });
       } else {
         setDisableCountdown(next);
       }
@@ -178,6 +189,9 @@ export default function MobileApp() {
   // ── 액션 핸들러 ─────────────────────────────────────────────────────
 
   const can = (action: string) => actions.includes(action);
+  const calibrationReady =
+    robot.calibration_valid?.length === 6 && robot.calibration_valid.every(Boolean);
+  const calibrationHeld = Boolean(robot.motor_enable_status?.some(Boolean));
   const post = (path: string) => fetch(path, { method: "POST" });
 
   const handleStartTeach = async () => {
@@ -192,8 +206,36 @@ export default function MobileApp() {
 
   const handleStopTeach = () => post("/api/teach/stop");
 
+  const handleStartReplay = async () => {
+    setReplayStarting(true);
+    setReplayMessage("");
+    try {
+      const response = await fetch("/api/replay/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speed_scale: speedScale }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        const recommended = Number(data.recommended_max_speed);
+        if (Number.isFinite(recommended) && recommended > 0) {
+          setSpeedScale(recommended);
+        }
+        setReplayMessage(data.reason || `Replay start failed (${response.status})`);
+      } else if (data.speed_adjusted) {
+        setReplayMessage(`Safety limit applied: ${Math.round(Number(data.speed_scale_applied) * 100)}%`);
+      }
+    } catch {
+      setReplayMessage("Replay start request failed");
+    } finally {
+      setReplayStarting(false);
+    }
+  };
+
   const handleEnableMotors = () =>
-    post("/api/robot/motors/enable").then(() => setMotorsFree(false));
+    post("/api/robot/motors/enable")
+      .then(r => r.json())
+      .then(data => { if (data.ok) setMotorsFree(false); });
 
   const handleStartFreedriveCountdown = () => setDisableCountdown(3);
   const handleCancelFreedriveCountdown = () => setDisableCountdown(0);
@@ -201,12 +243,16 @@ export default function MobileApp() {
   // ── 렌더 ────────────────────────────────────────────────────────────
 
   const modeColor: Record<string, string> = {
+    TEACH_STARTING: "#2563eb",
     TEACH_RECORDING: "#d97706",
+    TEACH_STOPPING: "#7c3aed",
     REPLAY_RECORDING: "#dc2626",
     REVIEW: "#6366f1",
     SAVED: "#22c55e",
     DISCARDED: "#6b7280",
     RETURN_HOME: "#0ea5e9",
+    DEBUG_RETURN: "#f59e0b",
+    DEBUG_REPLAY: "#dc2626",
   };
 
   return (
@@ -221,6 +267,10 @@ export default function MobileApp() {
           {robot.connected ? "🟢" : "🔴"}
         </span>
       </div>
+      <SafetyBanner robot={robot} mobile />
+
+      {/* Same-origin URLs keep the streams working on both HTTP :5002 and HTTPS :5003. */}
+      <MobileCameraGrid mode={mode} camera={camera} />
 
       {/* ── 메인 컨텐츠 ── */}
       <div style={S.content}>
@@ -255,9 +305,22 @@ export default function MobileApp() {
         {mode === "CALIBRATING" && (
           <MSection title="Calibrating…">
             <div style={{ ...S.badge, background: "#052e16", color: "#4ade80" }}>
-              ARM IS FREE — guide through full range
+              {calibrationHeld ? "ARM IS HELD — resume to continue" : "ARM IS FREE — guide through full range"}
             </div>
-            <MBtn label="Finish Calibration" onClick={() => post("/api/robot/calibrate/stop")} primary large disabled={!can("stop_calibration")} />
+            <div style={S.hint}>
+              {(robot.calibration_span ?? []).map((span, i) =>
+                `J${i + 1}: ${span.toFixed(3)}${robot.calibration_valid?.[i] ? " ✓" : " ✗"}`
+              ).join(" · ")}
+            </div>
+            <MBtn label="Finish Calibration" onClick={() => post("/api/robot/calibrate/stop")}
+              primary large disabled={!can("stop_calibration") || !calibrationReady} />
+            {calibrationHeld ? (
+              <MBtn label="Resume Calibration (Release Arm)"
+                onClick={() => post("/api/robot/calibrate/resume")} primary />
+            ) : (
+              <MBtn label="Hold Position" onClick={() => post("/api/hold")}
+                danger disabled={!can("hold_position")} />
+            )}
           </MSection>
         )}
 
@@ -292,6 +355,12 @@ export default function MobileApp() {
         )}
 
         {/* TEACH_RECORDING */}
+        {mode === "TEACH_STARTING" && (
+          <MSection title="Preparing Freedrive…">
+            <div style={S.hint}>Waiting for all six arm motors to report disabled. Do not guide the arm yet.</div>
+          </MSection>
+        )}
+
         {mode === "TEACH_RECORDING" && (
           <MSection title="Teaching in Progress">
             <GripperRow can={can} gripperRad={robot.gripper} />
@@ -324,6 +393,12 @@ export default function MobileApp() {
           </MSection>
         )}
 
+        {mode === "TEACH_STOPPING" && (
+          <MSection title="Stopping Teaching…">
+            <div style={S.hint}>Re-arming all axes and saving the trajectory. Please wait.</div>
+          </MSection>
+        )}
+
         {/* TRAJECTORY_CHECK */}
         {mode === "TRAJECTORY_CHECK" && (
           <MSection title="Trajectory Recorded">
@@ -345,18 +420,17 @@ export default function MobileApp() {
         {mode === "REPLAY_READY" && (
           <MSection title="Ready for Replay">
             <SpeedControl speedScale={speedScale} onChange={setSpeedScale} />
+            {replayMessage && <div style={{ ...S.hint, color: "#fca5a5" }}>{replayMessage}</div>}
             <MBtn
-              label={`Start Replay & Record (${Math.round(speedScale * 100)}%)`}
-              onClick={() => fetch("/api/replay/start", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ speed_scale: speedScale }),
-              })}
+              label={replayStarting ? "Starting…" : `Start Replay & Record (${Math.round(speedScale * 100)}%)`}
+              onClick={handleStartReplay}
               primary
-              disabled={!can("start_replay")}
+              disabled={!can("start_replay") || replayStarting}
             />
             <GripperRow can={can} gripperRad={robot.gripper} />
             <MBtn label="Hold Position" onClick={() => post("/api/hold")} danger disabled={!can("hold_position")} />
+            <MBtn label="Discard Without Replay" onClick={() => post("/api/episodes/discard")}
+              danger disabled={!can("discard_episode")} />
           </MSection>
         )}
 
@@ -369,6 +443,24 @@ export default function MobileApp() {
             <GripperRow can={can} gripperRad={robot.gripper} />
             <MBtn label="STOP REPLAY" onClick={() => post("/api/replay/stop")} primary large disabled={!can("stop_replay")} />
             <MBtn label="Hold Position" onClick={() => post("/api/hold")} danger disabled={!can("hold_position")} />
+          </MSection>
+        )}
+
+        {mode === "DEBUG_RETURN" && (
+          <MSection title="Dataset Debug Return">
+            <div style={S.hint}>Moving to the selected saved trajectory start. Stay clear.</div>
+            <MBtn label="Hold at Current Position" onClick={() => post("/api/hold")} danger large />
+          </MSection>
+        )}
+
+        {mode === "DEBUG_REPLAY" && (
+          <MSection title="Dataset Debug Replay">
+            <div style={{ ...S.hint, color: "#fca5a5", fontWeight: 700 }}>
+              Robot is moving without camera recording.
+            </div>
+            <MBtn label="STOP DEBUG REPLAY"
+              onClick={() => post("/api/episodes/debug_replay/stop")} danger large />
+            <MBtn label="Hold Position" onClick={() => post("/api/hold")} danger />
           </MSection>
         )}
 
@@ -435,6 +527,201 @@ export default function MobileApp() {
 
 // ── Sub-components ─────────────────────────────────────────────────────
 
+function MobileCameraGrid({ mode, camera }: { mode: AppMode; camera: CameraState }) {
+  const polarizerInfo = camera.cameras?.["polarizer"];
+  const hasPolarizer = polarizerInfo?.type === "spinnaker";
+  const [polarizerExpanded, setPolarizerExpanded] = useState(false);
+  const [streamEpoch, setStreamEpoch] = useState(0);
+  const [pageActive, setPageActive] = useState(() => !document.hidden);
+  const lastRestartRef = useRef(0);
+
+  const restartStreams = useCallback((force = false) => {
+    if (document.hidden) return;
+    setPageActive(true);
+    const now = Date.now();
+    // visibilitychange/pageshow/focus often arrive as one burst.
+    if (!force && now - lastRestartRef.current < 500) return;
+    lastRestartRef.current = now;
+    setStreamEpoch(value => value + 1);
+  }, []);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden) setPageActive(false);
+      else restartStreams();
+    };
+    const onPageHide = () => setPageActive(false);
+    const onPageShow = () => restartStreams();
+    const onFocus = () => restartStreams();
+    const onOnline = () => restartStreams(true);
+
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [restartStreams]);
+
+  return (
+    <div style={S.cameraPanel}>
+      <div style={S.cameraPanelHeader}>
+        <span>LIVE CAMERAS</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {(mode === "TEACH_RECORDING" || mode === "REPLAY_RECORDING") && (
+            <span style={S.cameraRecBadge}>● REC</span>
+          )}
+          <button type="button" onClick={() => restartStreams(true)} style={S.cameraReconnectButton}>
+            ↻ Reconnect
+          </button>
+        </div>
+      </div>
+      <div style={S.cameraGrid}>
+        {hasPolarizer && (
+          <MobileCamera
+            cameraId="polarizer" label="POLARIZER" active={pageActive} streamEpoch={streamEpoch}
+            mode="rgb" onExpand={() => setPolarizerExpanded(true)}
+          />
+        )}
+        <MobileCamera cameraId="cam0" label="CAM0 · EGO" active={pageActive} streamEpoch={streamEpoch} />
+        <MobileCamera cameraId="cam1" label="CAM1 · OVERVIEW" active={pageActive} streamEpoch={streamEpoch} />
+      </div>
+      {polarizerExpanded && <PolarizerExpandedModal onClose={() => setPolarizerExpanded(false)} />}
+    </div>
+  );
+}
+
+function PolarizerExpandedModal({ onClose }: { onClose: () => void }) {
+  const [viewMode, setViewMode] = useState<"rgb" | "aolp" | "dolp" | "grid" | "stokes">("rgb");
+  const [shotFlash, setShotFlash] = useState(false);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const streamUrl = `/stream/camera/polarizer?mode=${viewMode}`;
+
+  useEffect(() => {
+    const img = imgRef.current;
+    if (!img) return;
+    img.src = "";       // 이전 MJPEG 커넥션 확실히 종료
+    img.src = streamUrl; // 재연결
+  }, [streamUrl]);
+
+  const handleShot = () => {
+    fetch("/api/screenshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cam_id: "polarizer", mode: viewMode }),
+    }).then(() => {
+      setShotFlash(true);
+      setTimeout(() => setShotFlash(false), 900);
+    });
+  };
+
+  return (
+    <div style={S.polarizerModalRoot}>
+      <img ref={imgRef} alt="Polarizer live" style={S.polarizerModalImg} />
+      <button type="button" onClick={onClose} style={S.polarizerModalClose}>✕</button>
+      <button type="button" onClick={handleShot} style={S.polarizerModalShot}>
+        {shotFlash ? "✓ Saved" : "📷 Screenshot"}
+      </button>
+      <div style={S.polarizerModalModes}>
+        {(["rgb", "aolp", "dolp", "grid", "stokes"] as const).map(m => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => setViewMode(m)}
+            style={{
+              ...S.polarizerModalModeBtn,
+              background: viewMode === m ? "#0891b2" : "rgba(15,23,42,0.7)",
+            }}
+          >
+            {m === "grid" ? "2×2" : m === "stokes" ? "S1/S2" : m.toUpperCase()}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MobileCamera({
+  cameraId, label, active, streamEpoch, mode: viewMode, onExpand,
+}: {
+  cameraId: string; label: string; active: boolean; streamEpoch: number; mode?: string; onExpand?: () => void;
+}) {
+  const [retry, setRetry] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [shotFlash, setShotFlash] = useState(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamUrl = viewMode
+    ? `/stream/camera/${cameraId}?mode=${viewMode}&mobile=${streamEpoch}-${retry}`
+    : `/stream/camera/${cameraId}?mobile=${streamEpoch}-${retry}`;
+
+  const handleShot = () => {
+    fetch("/api/screenshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cam_id: cameraId, mode: viewMode ?? "rgb" }),
+    }).then(() => {
+      setShotFlash(true);
+      setTimeout(() => setShotFlash(false), 900);
+    });
+  };
+
+  useEffect(() => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    setLoaded(false);
+    setRetry(0);
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [active, streamEpoch]);
+
+  return (
+    <div style={S.cameraCard}>
+      <div style={S.cameraLabel}>
+        <span>{label}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ color: loaded ? "#4ade80" : "#fbbf24" }}>
+            {loaded ? "● LIVE" : "● WAIT"}
+          </span>
+          {onExpand && (
+            <button type="button" onClick={onExpand} style={S.cameraExpandButton}>⤢</button>
+          )}
+        </div>
+      </div>
+      <div style={S.cameraFrame}>
+        {!loaded && <div style={S.cameraPlaceholder}>
+          {active ? "Reconnecting camera…" : "Camera paused in background"}
+        </div>}
+        {loaded && (
+          <button type="button" onClick={handleShot} style={S.cameraShotButton}>
+            {shotFlash ? "✓" : "📷"}
+          </button>
+        )}
+        {active && (
+          <img
+            key={`${cameraId}-${streamEpoch}-${retry}`}
+            src={streamUrl}
+            alt={`${label} live stream`}
+            draggable={false}
+            style={{ ...S.cameraImage, opacity: loaded ? 1 : 0 }}
+            onLoad={() => setLoaded(true)}
+            onError={() => {
+              setLoaded(false);
+              if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+              retryTimerRef.current = setTimeout(() => setRetry(value => value + 1), 2000);
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
@@ -445,7 +732,7 @@ function MSection({ title, children }: { title: string; children: React.ReactNod
 }
 
 const GRIPPER_OPEN_RAD_M = 0.07;
-const GRIPPER_SNAPS_M = [0, 100];
+const GRIPPER_SNAPS_M = [0, 50, 70, 100];
 
 function radToSnapPctM(rad: number): number {
   const raw = Math.round((rad / GRIPPER_OPEN_RAD_M) * 100);
@@ -456,7 +743,7 @@ function radToSnapPctM(rad: number): number {
 
 function GripperRow({ can, gripperRad }: { can: (a: string) => boolean; gripperRad?: number }) {
   const [pct, setPct] = React.useState(() =>
-    gripperRad !== undefined ? radToSnapPctM(gripperRad) : 100
+    gripperRad !== undefined ? radToSnapPctM(gripperRad) : 70
   );
   const canAny = can("open_gripper") || can("close_gripper") || can("gripper_set");
 
@@ -478,7 +765,12 @@ function GripperRow({ can, gripperRad }: { can: (a: string) => boolean; gripperR
     }
   };
 
-  const SNAPS = [0, 100];
+  const handleChange = (val: number) => {
+    setPct(val);
+    sendGripper(val);
+  };
+
+  const SNAPS = GRIPPER_SNAPS_M;
 
   return (
     <div style={{ background: "#1e293b", borderRadius: 12, padding: "12px 14px", marginBottom: 8 }}>
@@ -488,22 +780,23 @@ function GripperRow({ can, gripperRad }: { can: (a: string) => boolean; gripperR
       {/* 슬라이더 */}
       <input
         type="range"
-        min={0} max={100} step={100}
+        min={0} max={100} step={5}
         value={pct}
         disabled={!canAny}
         onChange={e => {
-          const val = Number(e.target.value);
-          setPct(val);
-          sendGripper(val);
+          handleChange(Number(e.target.value));
         }}
         style={{ width: "100%", accentColor: "#22c55e", height: 32, cursor: canAny ? "pointer" : "default" }}
       />
       {/* 눈금 레이블 */}
       <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
         {SNAPS.map(v => (
-          <span key={v} style={{ fontSize: 10, color: v === pct ? "#22c55e" : "#475569", fontWeight: v === pct ? 700 : 400 }}>
+          <button key={v} type="button" disabled={!canAny} onClick={() => handleChange(v)} style={{
+            border: 0, background: "transparent", padding: "4px", cursor: canAny ? "pointer" : "default",
+            fontSize: 10, color: v === pct ? "#22c55e" : "#475569", fontWeight: v === pct ? 700 : 400,
+          }}>
             {v}%
-          </span>
+          </button>
         ))}
       </div>
     </div>
@@ -688,6 +981,156 @@ const S: Record<string, React.CSSProperties> = {
   connDot: {
     fontSize: 14,
     marginLeft: 4,
+  },
+  cameraPanel: {
+    padding: "8px 10px 10px",
+    background: "#111827",
+    borderBottom: "1px solid #334155",
+    flexShrink: 0,
+  },
+  cameraPanelHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    minHeight: 16,
+    marginBottom: 6,
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: 800,
+    letterSpacing: 1,
+  },
+  cameraRecBadge: {
+    color: "#f87171",
+    fontSize: 10,
+    letterSpacing: 0.5,
+  },
+  cameraReconnectButton: {
+    border: "1px solid #475569",
+    borderRadius: 6,
+    background: "#1e293b",
+    color: "#cbd5e1",
+    padding: "3px 7px",
+    fontSize: 9,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  cameraGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 8,
+  },
+  cameraCard: {
+    minWidth: 0,
+    overflow: "hidden",
+    borderRadius: 9,
+    border: "1px solid #334155",
+    background: "#020617",
+  },
+  cameraLabel: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 4,
+    padding: "5px 7px",
+    color: "#cbd5e1",
+    fontSize: 9,
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  cameraFrame: {
+    position: "relative",
+    width: "100%",
+    aspectRatio: "4 / 3",
+    overflow: "hidden",
+    background: "#020617",
+  },
+  cameraImage: {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    display: "block",
+    objectFit: "contain",
+    transition: "opacity 0.2s ease",
+  },
+  cameraExpandButton: {
+    background: "transparent",
+    color: "#94a3b8",
+    border: "none",
+    fontSize: 13,
+    lineHeight: 1,
+    padding: 2,
+  } as React.CSSProperties,
+  polarizerModalRoot: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 1000,
+    background: "#000",
+  } as React.CSSProperties,
+  polarizerModalImg: {
+    width: "100%",
+    height: "100%",
+    objectFit: "contain",
+    display: "block",
+  } as React.CSSProperties,
+  polarizerModalClose: {
+    position: "absolute",
+    top: 12, left: 12, zIndex: 2,
+    background: "rgba(15,23,42,0.7)",
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.3)",
+    borderRadius: 8,
+    width: 36, height: 36,
+    fontSize: 16,
+  } as React.CSSProperties,
+  polarizerModalShot: {
+    position: "absolute",
+    top: 12, right: 12, zIndex: 2,
+    background: "rgba(15,23,42,0.7)",
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.3)",
+    borderRadius: 8,
+    padding: "8px 14px",
+    fontSize: 13,
+    fontWeight: 700,
+  } as React.CSSProperties,
+  polarizerModalModes: {
+    position: "absolute",
+    bottom: 24, left: 0, right: 0,
+    display: "flex",
+    justifyContent: "center",
+    gap: 8,
+    zIndex: 2,
+  } as React.CSSProperties,
+  polarizerModalModeBtn: {
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.3)",
+    borderRadius: 8,
+    padding: "10px 18px",
+    fontSize: 13,
+    fontWeight: 700,
+  } as React.CSSProperties,
+  cameraShotButton: {
+    position: "absolute",
+    top: 4, right: 4, zIndex: 2,
+    background: "rgba(2,6,23,0.65)",
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.3)",
+    borderRadius: 5,
+    padding: "3px 6px",
+    fontSize: 12,
+    lineHeight: 1,
+  } as React.CSSProperties,
+  cameraPlaceholder: {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 6,
+    color: "#475569",
+    fontSize: 9,
+    textAlign: "center",
   },
   content: {
     flex: 1,

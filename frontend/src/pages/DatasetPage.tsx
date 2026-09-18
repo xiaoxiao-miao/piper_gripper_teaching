@@ -10,6 +10,55 @@ import { fmtDate, fmtDuration, fmtMb, statusLabel, takeDuration, type InspectorT
 // ── Constants ────────────────────────────────────────────────────────────
 const JOINT_COLORS = ["#6366f1", "#06b6d4", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6"];
 const JOINT_LABELS = ["J1", "J2", "J3", "J4", "J5", "J6"];
+const EPISODE_PAGE_SIZE = 24;
+
+interface EpisodePage {
+  items: Episode[];
+  page: number;
+  page_size: number;
+  total: number;
+  has_more: boolean;
+}
+
+interface DebugReplayStatus {
+  ok: boolean;
+  loaded: boolean;
+  source?: {
+    episode_id?: string;
+    take?: string;
+    source?: "teach" | "command";
+    filename?: string;
+    samples?: number;
+  };
+  trajectory_check?: {
+    duration_s?: number;
+    samples?: number;
+    max_joint_velocity_rad_s?: number;
+  };
+  operation?: "return" | "replay" | "sequence_return" | "sequence_replay" | null;
+  start_ready: boolean;
+  start_error_rad?: number | null;
+  robot_connected: boolean;
+  controller_state: string;
+  can_return: boolean;
+  can_start: boolean;
+  last_error?: string;
+  last_run_dir?: string | null;
+  last_diagnostics?: Record<string, any>;
+  worker?: { phase?: string; pid?: number; progress?: number; result?: Record<string, any> };
+  sequence?: {
+    active?: boolean;
+    sequence_id?: string;
+    cycles?: number;
+    cycle?: number;
+    label?: "A" | "B";
+    phase?: string;
+    speed_scale?: number;
+    completed_replays?: number;
+    total_replays?: number;
+    error?: string | null;
+  } | null;
+}
 
 // ── Joint Plot SVG (P1) ───────────────────────────────────────────────────
 const JointPlot = React.memo(function JointPlot({
@@ -310,6 +359,10 @@ function ConfirmInline({ label, onConfirm, onCancel }: {
 // ── Main ──────────────────────────────────────────────────────────────────
 export default function DatasetPage() {
   const [episodes, setEpisodes] = useState<Episode[]>([]);
+  const [episodePage, setEpisodePage] = useState(0);
+  const [episodeTotal, setEpisodeTotal] = useState(0);
+  const [episodesLoading, setEpisodesLoading] = useState(false);
+  const [episodesHasMore, setEpisodesHasMore] = useState(false);
   const [selected, setSelected] = useState<Episode | null>(null);
   const [selectedTake, setSelectedTake] = useState<string | null>(null);
   const [videoSource, setVideoSource] = useState<string>("color");
@@ -346,13 +399,49 @@ export default function DatasetPage() {
   const [focusedEp, setFocusedEp] = useState<string | null>(null);
   const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
   const [exportModal, setExportModal] = useState(false);
+  const [debugSource, setDebugSource] = useState<"teach" | "command">("teach");
+  const [debugSpeed, setDebugSpeed] = useState<0.3 | 0.5 | 0.7>(0.3);
+  const [debugStatus, setDebugStatus] = useState<DebugReplayStatus | null>(null);
+  const [debugRequesting, setDebugRequesting] = useState(false);
+  const [debugConfirm, setDebugConfirm] = useState(false);
+  const [debugMessage, setDebugMessage] = useState("");
+  const [debugSeqA, setDebugSeqA] = useState("episode_20260827_122842");
+  const [debugSeqB, setDebugSeqB] = useState("episode_20260827_134422");
+  const [debugSeqTakeA, setDebugSeqTakeA] = useState("take_001");
+  const [debugSeqTakeB, setDebugSeqTakeB] = useState("take_001");
+  const [debugSeqCycles, setDebugSeqCycles] = useState(1);
+  const [debugSeqConfirm, setDebugSeqConfirm] = useState(false);
+
+  const fetchEpisodePage = useCallback((page: number, replace: boolean) => {
+    setEpisodesLoading(true);
+    fetch(`/api/episodes?page=${page}&page_size=${EPISODE_PAGE_SIZE}`)
+      .then(r => r.json())
+      .then((data: EpisodePage | Episode[]) => {
+        const payload: EpisodePage = Array.isArray(data)
+          ? { items: data, page: 1, page_size: data.length, total: data.length, has_more: false }
+          : data;
+        setEpisodes(previous => {
+          if (replace) return payload.items;
+          const byId = new Map(previous.map(item => [item.episode_id, item]));
+          payload.items.forEach(item => byId.set(item.episode_id, item));
+          return Array.from(byId.values());
+        });
+        setEpisodePage(payload.page);
+        setEpisodeTotal(payload.total);
+        setEpisodesHasMore(payload.has_more);
+      })
+      .catch(() => {})
+      .finally(() => setEpisodesLoading(false));
+  }, []);
 
   const fetchEpisodes = useCallback(() => {
-    fetch("/api/episodes")
-      .then(r => r.json())
-      .then((data: Episode[]) => setEpisodes(data))
-      .catch(() => {});
-  }, []);
+    fetchEpisodePage(1, true);
+  }, [fetchEpisodePage]);
+
+  const loadMoreEpisodes = useCallback(() => {
+    if (episodesLoading || !episodesHasMore) return;
+    fetchEpisodePage(episodePage + 1, false);
+  }, [episodePage, episodesHasMore, episodesLoading, fetchEpisodePage]);
 
   useEffect(() => { fetchEpisodes(); }, [fetchEpisodes]);
 
@@ -366,7 +455,72 @@ export default function DatasetPage() {
     setTrajectoryData(null);
     setCurrentTime(0);
     setEditingTask(false);
+    setDebugConfirm(false);
+    setDebugMessage("");
   }, [selectedId]);
+
+  const refreshDebugStatus = useCallback(() => {
+    fetch("/api/episodes/debug_replay/status")
+      .then(r => r.json())
+      .then((status: DebugReplayStatus) => setDebugStatus(status))
+      .catch(() => setDebugMessage("Could not read robot debug status"));
+  }, []);
+
+  useEffect(() => {
+    if (inspectorTab !== "debug") return;
+    refreshDebugStatus();
+    const timer = window.setInterval(refreshDebugStatus, 500);
+    return () => window.clearInterval(timer);
+  }, [inspectorTab, refreshDebugStatus]);
+
+  const debugPost = useCallback((path: string, body?: object) => {
+    setDebugRequesting(true);
+    setDebugMessage("");
+    return fetch(path, {
+      method: "POST",
+      ...(body ? {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      } : {}),
+    })
+      .then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) {
+          throw new Error(data.reason || `Request failed (${response.status})`);
+        }
+        setDebugMessage(data.operation === "return" ? "Returning to trajectory start…" : "Command accepted");
+        return data;
+      })
+      .catch(error => {
+        setDebugMessage(error instanceof Error ? error.message : "Debug request failed");
+        return null;
+      })
+      .finally(() => {
+        setDebugRequesting(false);
+        refreshDebugStatus();
+      });
+  }, [refreshDebugStatus]);
+
+  const loadDebugTrajectory = useCallback(() => {
+    if (!selectedId || !selectedTake) return;
+    setDebugConfirm(false);
+    debugPost(
+      `/api/episodes/${selectedId}/takes/${selectedTake}/debug_replay/load`,
+      { source: debugSource },
+    );
+  }, [selectedId, selectedTake, debugSource, debugPost]);
+
+  const startDebugSequence = useCallback(() => {
+    setDebugSeqConfirm(false);
+    debugPost("/api/episodes/debug_replay/sequence/start", {
+      items: [
+        { episode_id: debugSeqA, take: debugSeqTakeA, source: "teach" },
+        { episode_id: debugSeqB, take: debugSeqTakeB, source: "teach" },
+      ],
+      cycles: debugSeqCycles,
+      speed_scale: debugSpeed,
+    });
+  }, [debugPost, debugSeqA, debugSeqB, debugSeqTakeA, debugSeqTakeB, debugSeqCycles, debugSpeed]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -449,6 +603,7 @@ export default function DatasetPage() {
     fetch(`/api/episodes/${epId}`, { method: "DELETE" })
       .then(() => {
         setEpisodes(prev => prev.filter(e => e.episode_id !== epId));
+        setEpisodeTotal(total => Math.max(0, total - 1));
         setSelected(prev => prev?.episode_id === epId ? null : prev);
       })
       .catch(() => {})
@@ -618,19 +773,26 @@ export default function DatasetPage() {
     }).then(() => setEditMeta(meta)).catch(() => {});
   }, [selectedId, selectedTake]);
 
-  // 자동 그리퍼 열림 감지: teach 데이터에서 10초 이후 closed→open 전환 시각
-  const autoGripperOpenT = useMemo((): number | null => {
-    const samples = jointsData?.teach;
-    if (!samples) return null;
+  // Converter와 동일하게 executed feedback의 closed→open을 사용한다. 기본
+  // export는 video time으로 정규화하고 physical mode는 실제 replay time 유지.
+  const gripperOpenTimes = useMemo((): { normalized: number | null; physical: number | null; physicalDuration?: number } => {
+    const samples = jointsData?.executed?.length ? jointsData.executed : jointsData?.teach;
+    if (!samples?.length) return { normalized: null, physical: null };
+    const physicalDuration = samples[samples.length - 1]?.t;
     const MID = 0.02219;
-    let prevOpen: boolean | null = null;
-    for (const s of samples) {
-      const isOpen = s.gripper > MID;
-      if (prevOpen !== null && s.t > 10 && !prevOpen && isOpen) return s.t;
-      prevOpen = isOpen;
-    }
-    return null;
-  }, [jointsData]);
+    const find = (scale: number) => {
+      let prevOpen: boolean | null = null;
+      for (const s of samples) {
+        const t = s.t * scale;
+        const isOpen = s.gripper > MID;
+        if (prevOpen !== null && t > 10 && !prevOpen && isOpen) return t;
+        prevOpen = isOpen;
+      }
+      return null;
+    };
+    const normalizedScale = videoDuration && physicalDuration > 0 ? videoDuration / physicalDuration : 1;
+    return { normalized: find(normalizedScale), physical: find(1), physicalDuration };
+  }, [jointsData, videoDuration]);
 
   const selectSameTask = useCallback(() => {
     // 현재 선택된 에피소드들의 task 집합 추출
@@ -650,6 +812,12 @@ export default function DatasetPage() {
   }, [episodes, filtered, selectedEps]);
 
   const currentTake: EpisodeTake | null = selected?.takes.find(t => t.take === selectedTake) ?? null;
+  const debugLoadedForSelection = Boolean(
+    debugStatus?.loaded
+    && debugStatus.source?.episode_id === selectedId
+    && debugStatus.source?.take === selectedTake
+    && debugStatus.source?.source === debugSource
+  );
   const cameraTabs = useMemo<CameraTab[]>(() => {
     if (!currentTake) return [];
     const streamTabs = (currentTake.cameras ?? []).flatMap(camera => {
@@ -724,6 +892,23 @@ export default function DatasetPage() {
     }
   }, [cameraTabs, videoSource]);
 
+  // 옛날 take(호환 재구성 패치 이전에 녹화된 것)에도 AoLP/DoLP/2x2 Grid 뷰를 새로
+  // 만들어 넣기 위한 재생성 버튼 — 서버가 알아서 이미 있는 파일은 건너뜀.
+  const [regeneratingVideos, setRegeneratingVideos] = useState(false);
+  const regenerateVideos = useCallback(() => {
+    if (!selectedId || !selectedTake || regeneratingVideos) return;
+    setRegeneratingVideos(true);
+    fetch(`/api/episodes/${selectedId}/takes/${selectedTake}/regenerate_videos`, { method: "POST" })
+      .then(() => fetch(`/api/episodes/${selectedId}`))
+      .then(r => r.json())
+      .then((ep: Episode) => {
+        setSelected(ep);
+        setEpisodes(prev => prev.map(e => e.episode_id === selectedId ? ep : e));
+      })
+      .catch(() => {})
+      .finally(() => setRegeneratingVideos(false));
+  }, [selectedId, selectedTake, regeneratingVideos]);
+
   const duration = takeDuration(jointsData);
   const selectedBatch = useMemo(
     () => episodes.filter(ep => selectedEps.has(ep.episode_id)),
@@ -761,7 +946,7 @@ export default function DatasetPage() {
         <div style={styles.headerLeft}>
           <h2 style={styles.title}>Dataset Browser</h2>
           <span style={styles.stats}>
-            {sorted.length}/{episodes.length} ep · {totalTakes} takes · {fmtMb(totalSize)}
+            {sorted.length}/{episodeTotal || episodes.length} ep loaded · {totalTakes} takes · {fmtMb(totalSize)}
           </span>
         </div>
         <div style={styles.headerRight}>
@@ -803,7 +988,7 @@ export default function DatasetPage() {
               </button>
             ))}
           </div>
-          <button style={styles.refreshBtn} onClick={fetchEpisodes}>↻</button>
+          <button style={styles.refreshBtn} onClick={() => fetchEpisodes()} disabled={episodesLoading}>↻</button>
         </div>
       </div>
 
@@ -877,7 +1062,7 @@ export default function DatasetPage() {
         }}>
           <div style={styles.collectionHeader}>
             <span>Collection</span>
-            <span>{sorted.length} shown</span>
+            <span>{sorted.length} shown · {episodes.length}/{episodeTotal || episodes.length} loaded</span>
           </div>
           {viewMode === "compact" && sorted.length > 0 && (
             <div style={styles.compactHead}>
@@ -922,6 +1107,15 @@ export default function DatasetPage() {
             );
           })}
           </div>
+          {(episodesHasMore || episodesLoading) && (
+            <button
+              style={styles.loadMoreBtn}
+              onClick={loadMoreEpisodes}
+              disabled={episodesLoading}
+            >
+              {episodesLoading ? "Loading…" : `Load next ${EPISODE_PAGE_SIZE}`}
+            </button>
+          )}
         </div>
 
         {/* Detail panel */}
@@ -1012,6 +1206,7 @@ export default function DatasetPage() {
               {([
                 ["preview", "Preview"],
                 ["trajectory", "Trajectory"],
+                ["debug", "Robot Debug"],
                 ["postprocess", "Postprocess"],
                 ["export", "Export"],
               ] as Array<[InspectorTab, string]>).map(([tab, label]) => (
@@ -1028,6 +1223,23 @@ export default function DatasetPage() {
                 </button>
               ))}
             </div>
+
+            {inspectorTab === "preview" && (
+              <div style={{ display: "flex", justifyContent: "flex-end", padding: "0 4px 6px" }}>
+                <button
+                  onClick={regenerateVideos}
+                  disabled={regeneratingVideos}
+                  title="AoLP/DoLP/2x2 Grid 등 새로 추가된 뷰를 이 take에 다시 생성 (이미 있는 파일은 건너뜀)"
+                  style={{
+                    padding: "4px 10px", borderRadius: 6, border: "1px solid #e2e8f0",
+                    background: "#f8fafc", color: "#374151", fontWeight: 600, fontSize: 11,
+                    cursor: regeneratingVideos ? "default" : "pointer",
+                  }}
+                >
+                  {regeneratingVideos ? "재생성 중…" : "🔄 카메라 영상 재생성"}
+                </button>
+              </div>
+            )}
 
             <div style={styles.workspaceGrid}>
               <VideoPane
@@ -1153,12 +1365,268 @@ export default function DatasetPage() {
                 </>
               )}
 
+              {inspectorTab === "debug" && (
+                <div style={styles.workspaceWide}>
+                  <div style={{ ...styles.workspaceCell, height: "100%" }}>
+                    <div style={styles.trajCellHeader}>
+                      <span>Robot Debug Replay</span>
+                      <span style={{
+                        fontSize: 10,
+                        color: debugStatus?.robot_connected ? "#16a34a" : "#dc2626",
+                      }}>
+                        {debugStatus?.robot_connected ? "● ROBOT CONNECTED" : "● ROBOT DISCONNECTED"}
+                      </span>
+                    </div>
+                    <div style={{ ...styles.workspaceCellBody, padding: 14 }}>
+                      <div style={styles.debugWarning}>
+                        ⚠ The robot will physically move. Clear the workspace and keep Hold/E-stop ready.
+                        Camera recording is disabled for this debug run.
+                      </div>
+
+                      <div style={{ ...styles.debugSection, borderColor: "#c4b5fd", background: "#faf5ff" }}>
+                        <div style={styles.sectionLabel}>A/B · Repeated trajectory comparison</div>
+                        <div style={styles.debugMeta}>
+                          Every replay uses teach_joint.csv and a full Safe Return. Trajectories are never joined directly.
+                        </div>
+                        {(["A", "B"] as const).map(label => {
+                          const episodeId = label === "A" ? debugSeqA : debugSeqB;
+                          const take = label === "A" ? debugSeqTakeA : debugSeqTakeB;
+                          const setEpisode = label === "A" ? setDebugSeqA : setDebugSeqB;
+                          const setTake = label === "A" ? setDebugSeqTakeA : setDebugSeqTakeB;
+                          const episode = episodes.find(ep => ep.episode_id === episodeId);
+                          return (
+                            <div key={label} style={{ display: "grid", gridTemplateColumns: "24px 1fr 110px", gap: 6, marginTop: 8 }}>
+                              <strong style={{ alignSelf: "center", color: "#6d28d9" }}>{label}</strong>
+                              <select
+                                value={episodeId}
+                                disabled={Boolean(debugStatus?.sequence?.active)}
+                                onChange={event => {
+                                  const next = event.target.value;
+                                  setEpisode(next);
+                                  const nextEpisode = episodes.find(ep => ep.episode_id === next);
+                                  setTake(nextEpisode?.takes?.[0]?.take ?? "take_001");
+                                  setDebugSeqConfirm(false);
+                                }}
+                                style={styles.debugSelect}
+                              >
+                                {episodes.map(ep => <option key={ep.episode_id} value={ep.episode_id}>{ep.episode_id}</option>)}
+                              </select>
+                              <select
+                                value={take}
+                                disabled={Boolean(debugStatus?.sequence?.active)}
+                                onChange={event => { setTake(event.target.value); setDebugSeqConfirm(false); }}
+                                style={styles.debugSelect}
+                              >
+                                {(episode?.takes ?? []).map(item => <option key={item.take} value={item.take}>{item.take}</option>)}
+                              </select>
+                            </div>
+                          );
+                        })}
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}>
+                          <label style={styles.debugMeta}>Cycles</label>
+                          <select
+                            value={debugSeqCycles}
+                            disabled={Boolean(debugStatus?.sequence?.active)}
+                            onChange={event => { setDebugSeqCycles(Number(event.target.value)); setDebugSeqConfirm(false); }}
+                            style={{ ...styles.debugSelect, width: 64 }}
+                          >
+                            {[1, 2, 3, 4, 5].map(value => <option key={value} value={value}>{value}</option>)}
+                          </select>
+                          <span style={styles.debugMeta}>· {debugSeqCycles * 2} physical replays · {Math.round(debugSpeed * 100)}%</span>
+                        </div>
+                        {debugStatus?.sequence?.active ? (
+                          <div style={{ marginTop: 10 }}>
+                            <div style={styles.debugMeta}>
+                              Cycle {debugStatus.sequence.cycle}/{debugStatus.sequence.cycles} · {debugStatus.sequence.label} · {debugStatus.sequence.phase}
+                              {debugStatus.worker?.pid ? ` · worker ${debugStatus.worker.pid}` : ""}
+                              {debugStatus.worker?.progress !== undefined ? ` · ${Math.round(debugStatus.worker.progress * 100)}%` : ""}
+                            </div>
+                            <button style={styles.debugStopBtn} onClick={() => debugPost("/api/episodes/debug_replay/stop")}>
+                              ■ Stop Entire A/B Sequence
+                            </button>
+                          </div>
+                        ) : !debugSeqConfirm ? (
+                          <button
+                            style={{ ...styles.debugPrimaryBtn, marginTop: 10 }}
+                            disabled={
+                              debugRequesting
+                              || !debugStatus?.robot_connected
+                              || Boolean(debugStatus?.operation)
+                              || !episodes.some(ep => ep.episode_id === debugSeqA && ep.takes?.some(item => item.take === debugSeqTakeA))
+                              || !episodes.some(ep => ep.episode_id === debugSeqB && ep.takes?.some(item => item.take === debugSeqTakeB))
+                            }
+                            onClick={() => setDebugSeqConfirm(true)}
+                          >
+                            Start A/B Sequence
+                          </button>
+                        ) : (
+                          <div style={{ ...styles.debugConfirmBox, marginTop: 10 }}>
+                            <div>Confirm {debugSeqCycles * 2} physical replays with Safe Return before every replay.</div>
+                            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                              <button style={styles.debugCancelBtn} onClick={() => setDebugSeqConfirm(false)}>Cancel</button>
+                              <button style={styles.debugStopBtn} onClick={startDebugSequence}>Confirm — Run A/B</button>
+                            </div>
+                          </div>
+                        )}
+                        {debugStatus?.sequence && !debugStatus.sequence.active && debugStatus.sequence.sequence_id && (
+                          <div style={styles.debugMeta}>
+                            Last sequence: {debugStatus.sequence.sequence_id} · {debugStatus.sequence.phase}
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={styles.debugSection}>
+                        <div style={styles.sectionLabel}>1 · Select and load source</div>
+                        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                          {(["teach", "command"] as const).map(source => (
+                            <button
+                              key={source}
+                              onClick={() => { setDebugSource(source); setDebugConfirm(false); }}
+                              disabled={Boolean(debugStatus?.operation)}
+                              style={{
+                                ...styles.debugChoice,
+                                background: debugSource === source ? "#334155" : "#f1f5f9",
+                                color: debugSource === source ? "#fff" : "#475569",
+                              }}
+                            >
+                              {source === "teach" ? "teach_joint.csv (recommended)" : "replay_command.csv"}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          style={styles.debugPrimaryBtn}
+                          disabled={debugRequesting || Boolean(debugStatus?.operation) || !selectedTake}
+                          onClick={loadDebugTrajectory}
+                        >
+                          {debugLoadedForSelection ? "✓ Trajectory Loaded" : "Load Trajectory"}
+                        </button>
+                        {debugStatus?.source && (
+                          <div style={styles.debugMeta}>
+                            Loaded: {debugStatus.source.episode_id}/{debugStatus.source.take}/{debugStatus.source.filename}
+                            {debugStatus.source.samples ? ` · ${debugStatus.source.samples} samples` : ""}
+                            {debugStatus.trajectory_check?.duration_s !== undefined
+                              ? ` · ${debugStatus.trajectory_check.duration_s}s` : ""}
+                            {debugStatus.trajectory_check?.max_joint_velocity_rad_s !== undefined
+                              ? ` · max ${debugStatus.trajectory_check.max_joint_velocity_rad_s} rad/s` : ""}
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={styles.debugSection}>
+                        <div style={styles.sectionLabel}>2 · Return safely to trajectory start</div>
+                        <div style={styles.debugMeta}>
+                          Start error: {debugStatus?.start_error_rad !== null && debugStatus?.start_error_rad !== undefined
+                            ? `${debugStatus.start_error_rad.toFixed(4)} rad`
+                            : "—"}
+                          {debugStatus?.start_ready ? " · ✓ READY" : " · return required"}
+                        </div>
+                        <button
+                          style={styles.debugSecondaryBtn}
+                          disabled={debugRequesting || !debugLoadedForSelection || !debugStatus?.can_return}
+                          onClick={() => debugPost("/api/episodes/debug_replay/return")}
+                        >
+                          {debugStatus?.operation === "return" ? "Returning…" : "Return to Start"}
+                        </button>
+                      </div>
+
+                      <div style={styles.debugSection}>
+                        <div style={styles.sectionLabel}>3 · Replay without recording</div>
+                        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                          {([0.3, 0.5, 0.7] as const).map(speed => (
+                            <button
+                              key={speed}
+                              onClick={() => { setDebugSpeed(speed); setDebugConfirm(false); }}
+                              disabled={Boolean(debugStatus?.operation)}
+                              style={{
+                                ...styles.debugSpeedBtn,
+                                background: debugSpeed === speed ? "#4f46e5" : "#eef2ff",
+                                color: debugSpeed === speed ? "#fff" : "#4338ca",
+                              }}
+                            >
+                              {Math.round(speed * 100)}%
+                            </button>
+                          ))}
+                        </div>
+                        {debugStatus?.operation === "replay" ? (
+                          <button
+                            style={styles.debugStopBtn}
+                            onClick={() => debugPost("/api/episodes/debug_replay/stop")}
+                          >
+                            ■ Stop Debug Replay
+                          </button>
+                        ) : !debugConfirm ? (
+                          <button
+                            style={styles.debugPrimaryBtn}
+                            disabled={debugRequesting || !debugLoadedForSelection || !debugStatus?.can_start}
+                            onClick={() => setDebugConfirm(true)}
+                          >
+                            Replay without Recording
+                          </button>
+                        ) : (
+                          <div style={styles.debugConfirmBox}>
+                            <div>Confirm physical robot motion at {Math.round(debugSpeed * 100)}% speed.</div>
+                            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                              <button style={styles.debugCancelBtn} onClick={() => setDebugConfirm(false)}>Cancel</button>
+                              <button
+                                style={styles.debugStopBtn}
+                                onClick={() => {
+                                  setDebugConfirm(false);
+                                  debugPost("/api/episodes/debug_replay/start", { speed_scale: debugSpeed });
+                                }}
+                              >
+                                Confirm — Move Robot
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {debugStatus?.operation === "return" && (
+                          <button
+                            style={{ ...styles.debugStopBtn, marginTop: 8 }}
+                            onClick={() => debugPost("/api/hold")}
+                          >
+                            ⚠ Hold at Current Position
+                          </button>
+                        )}
+                      </div>
+
+                      {(debugMessage || debugStatus?.last_error) && (
+                        <div style={{
+                          ...styles.debugMessage,
+                          color: debugStatus?.last_error ? "#b91c1c" : "#475569",
+                        }}>
+                          {debugStatus?.last_error || debugMessage}
+                        </div>
+                      )}
+
+                      {(debugStatus?.last_run_dir || debugStatus?.last_diagnostics) && (
+                        <div style={styles.debugDiagnostics}>
+                          <div style={styles.sectionLabel}>Last debug result</div>
+                          <div style={styles.debugMeta}>{debugStatus.last_run_dir}</div>
+                          <div style={styles.summaryGrid}>
+                            <SummaryItem label="Commands" value={String(debugStatus.last_diagnostics?.command_samples ?? "—")} />
+                            <SummaryItem label="Feedback" value={String(debugStatus.last_diagnostics?.executed_samples ?? "—")} />
+                            <SummaryItem label="Max source step" value={String(debugStatus.last_diagnostics?.max_source_step ?? "—")} />
+                            <SummaryItem label="Max lateness" value={debugStatus.last_diagnostics?.max_lateness_ms !== undefined ? `${debugStatus.last_diagnostics.max_lateness_ms} ms` : "—"} />
+                            <SummaryItem label="Command gap" value={debugStatus.last_diagnostics?.command_gap_max_ms !== undefined ? `${debugStatus.last_diagnostics.command_gap_max_ms} ms` : "—"} />
+                            <SummaryItem label="Feedback gap" value={debugStatus.last_diagnostics?.feedback_gap_max_ms !== undefined ? `${debugStatus.last_diagnostics.feedback_gap_max_ms} ms` : "—"} />
+                            <SummaryItem label="Speed" value={debugStatus.last_diagnostics?.speed_scale !== undefined ? `${Math.round(debugStatus.last_diagnostics.speed_scale * 100)}%` : "—"} />
+                            <SummaryItem label="Completed" value={debugStatus.last_diagnostics?.completed ? "Yes" : "No"} />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {inspectorTab === "postprocess" && editMeta !== null && (
                 <>
                   <div style={styles.workspaceWide}>
                     <EditPanel
                       editMeta={editMeta}
-                      autoGripperOpenT={autoGripperOpenT}
+                      autoGripperOpenT={gripperOpenTimes.normalized}
+                      physicalGripperOpenT={gripperOpenTimes.physical}
+                      physicalDuration={gripperOpenTimes.physicalDuration}
                       episodeId={selectedId!}
                       take={selectedTake!}
                       currentTime={currentTime}
@@ -1166,7 +1634,8 @@ export default function DatasetPage() {
                       selectedMaskCameraId={postprocessMaskCameraId}
                       onSave={meta => {
                         saveEditMeta(meta);
-                        const hasAny = meta.trim.enabled || meta.mask.enabled;
+                        const hasAny = meta.trim.enabled || meta.mask.enabled
+                          || meta.timing?.mode === "physical_replay";
                         setEpisodes(prev => prev.map(e =>
                           e.episode_id === selectedId ? { ...e, has_postprocess: hasAny } : e
                         ));
@@ -1251,10 +1720,12 @@ export default function DatasetPage() {
 // ── EditPanel ─────────────────────────────────────────────────────────────
 
 function EditPanel({
-  editMeta, autoGripperOpenT, episodeId, take, currentTime, duration, selectedMaskCameraId, onSave,
+  editMeta, autoGripperOpenT, physicalGripperOpenT, physicalDuration, episodeId, take, currentTime, duration, selectedMaskCameraId, onSave,
 }: {
   editMeta: EditMeta;
   autoGripperOpenT: number | null;
+  physicalGripperOpenT: number | null;
+  physicalDuration?: number;
   episodeId: string;
   take: string;
   currentTime: number;
@@ -1264,10 +1735,18 @@ function EditPanel({
 }) {
   const [trim, setTrim] = React.useState(editMeta.trim);
   const [mask, setMask] = React.useState(editMeta.mask);
+  const [timingMode, setTimingMode] = React.useState<"teaching_normalized" | "physical_replay">(
+    editMeta.timing?.mode ?? "teaching_normalized"
+  );
   const [dirty, setDirty] = React.useState(false);
 
   // editMeta prop이 바뀌면(take 전환) 로컬 상태 동기화
-  React.useEffect(() => { setTrim(editMeta.trim); setMask(editMeta.mask); setDirty(false); }, [editMeta]);
+  React.useEffect(() => {
+    setTrim(editMeta.trim);
+    setMask(editMeta.mask);
+    setTimingMode(editMeta.timing?.mode ?? "teaching_normalized");
+    setDirty(false);
+  }, [editMeta]);
   React.useEffect(() => {
     if (!selectedMaskCameraId) return;
     const current = mask.camera_id || selectedMaskCameraId;
@@ -1276,11 +1755,13 @@ function EditPanel({
     setDirty(true);
   }, [selectedMaskCameraId, mask.camera_id]);
 
-  const effectiveCutT = trim.cut_t ?? autoGripperOpenT;
+  const activeAutoOpenT = timingMode === "physical_replay" ? physicalGripperOpenT : autoGripperOpenT;
+  const activeDuration = timingMode === "physical_replay" ? physicalDuration : duration;
+  const effectiveCutT = trim.cut_t ?? activeAutoOpenT;
   const trimEnd = effectiveCutT !== null ? effectiveCutT + trim.margin : null;
   const targetCamera = mask.camera_id || selectedMaskCameraId;
 
-  const save = () => { onSave({ trim, mask }); setDirty(false); };
+  const save = () => { onSave({ trim, mask, timing: { mode: timingMode } }); setDirty(false); };
 
   return (
     <div style={{ height: "100%", minHeight: 0, border: "1px solid #e2e8f0", borderRadius: 10, overflow: "hidden", background: "#fff", display: "flex", flexDirection: "column" }}>
@@ -1292,10 +1773,27 @@ function EditPanel({
         <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
           {trim.enabled && <span style={{ background: "#dbeafe", color: "#1d4ed8", borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 }}>Trim ON</span>}
           {mask.enabled && <span style={{ background: "#d1fae5", color: "#065f46", borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 }}>Mask ON</span>}
+          {timingMode === "physical_replay" && <span style={{ background: "#fef3c7", color: "#92400e", borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 }}>Physical timing</span>}
           {dirty && <span style={{ color: "#ef4444", fontSize: 11, fontWeight: 800 }}>Unsaved</span>}
         </span>
       </div>
       <div style={{ padding: "12px 14px", background: "#fff", overflow: "auto", minHeight: 0 }}>
+          <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 7, padding: "8px 10px", marginBottom: 12 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 700, color: "#78350f", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={timingMode === "physical_replay"}
+                onChange={e => {
+                  setTimingMode(e.target.checked ? "physical_replay" : "teaching_normalized");
+                  setDirty(true);
+                }}
+              />
+              실제 Replay 속도로 export (Teaching 속도 보정 안 함)
+            </label>
+            <div style={{ marginTop: 4, marginLeft: 22, fontSize: 11, color: "#92400e" }}>
+              너무 빠르게 보이는 에피소드에만 사용합니다. 영상과 trajectory를 실제 실행 시간으로 함께 늘립니다.
+            </div>
+          </div>
           {/* ── Trim / Mask 가로 grid ── */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start", marginBottom: 12 }}>
           {/* ── Trim Editor ── */}
@@ -1306,8 +1804,8 @@ function EditPanel({
 
             {/* 감지 정보 */}
             <div style={{ background: "#f1f5f9", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "#374151", marginBottom: 8 }}>
-              {autoGripperOpenT !== null
-                ? <>자동 감지: <strong>t = {autoGripperOpenT.toFixed(2)}s</strong> (10초 이후 첫 gripper open)</>
+              {activeAutoOpenT !== null
+                ? <>자동 감지: <strong>t = {activeAutoOpenT.toFixed(2)}s</strong> ({timingMode === "physical_replay" ? "실제 replay" : "정규화 영상"} 시간)</>
                 : <span style={{ color: "#94a3b8" }}>그리퍼 열림 전환 감지 안 됨 (teach 데이터 없거나 10초 이내)</span>}
             </div>
 
@@ -1324,7 +1822,7 @@ function EditPanel({
                   <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>Gripper open t (s):</span>
                   <input
                     type="number" step="0.1" min={0}
-                    placeholder={autoGripperOpenT !== null ? autoGripperOpenT.toFixed(2) : "auto"}
+                    placeholder={activeAutoOpenT !== null ? activeAutoOpenT.toFixed(2) : "auto"}
                     value={trim.cut_t ?? ""}
                     onChange={e => {
                       const v = e.target.value === "" ? null : parseFloat(e.target.value);
@@ -1359,7 +1857,7 @@ function EditPanel({
 
                 {/* 최종 trim 시각 표시 */}
                 {(() => {
-                  const overDuration = trimEnd !== null && duration !== undefined && trimEnd > duration;
+                  const overDuration = trimEnd !== null && activeDuration !== undefined && trimEnd > activeDuration;
                   const underDuration = trimEnd !== null && trimEnd < 0;
                   const isWarning = overDuration || underDuration;
                   return (
@@ -1374,13 +1872,13 @@ function EditPanel({
                           <span style={{ color: "#94a3b8" }}> ({effectiveCutT.toFixed(2)} {trim.margin >= 0 ? "+" : "-"} {Math.abs(trim.margin).toFixed(1)}s)</span>
                         )}
                       </div>
-                      {duration !== undefined && (
+                      {activeDuration !== undefined && (
                         <div style={{ marginTop: 2, color: isWarning ? "#c2410c" : "#94a3b8" }}>
                           {underDuration
                             ? "⚠ 최종 컷이 0초보다 앞입니다"
                             : overDuration
-                            ? `⚠ 영상 길이 ${duration.toFixed(1)}s 초과 → trim 효과 없음`
-                            : `영상 길이: ${duration.toFixed(1)}s`}
+                            ? `⚠ export 길이 ${activeDuration.toFixed(1)}s 초과 → trim 효과 없음`
+                            : `export 길이: ${activeDuration.toFixed(1)}s`}
                         </div>
                       )}
                     </div>
@@ -1797,6 +2295,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   linearList: { display: "flex", flexDirection: "column", gap: 8 },
   gridList: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 },
+  loadMoreBtn: {
+    width: "100%", border: "1px solid #c7d2fe", borderRadius: 8,
+    background: "#eef2ff", color: "#4338ca", padding: "9px 12px",
+    fontSize: 11, fontWeight: 800, cursor: "pointer", flexShrink: 0,
+  },
   detailPanel: {
     flex: 1, overflowY: "auto", background: "#fff", borderRadius: 10,
     border: "1px solid #e5e7eb", padding: 16,
@@ -1974,6 +2477,127 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1.5,
     color: "#475569",
     marginBottom: 12,
+  },
+  debugWarning: {
+    border: "1px solid #fecaca",
+    borderRadius: 8,
+    background: "#fff1f2",
+    color: "#9f1239",
+    padding: "10px 12px",
+    fontSize: 12,
+    lineHeight: 1.5,
+    fontWeight: 700,
+    marginBottom: 10,
+  },
+  debugSection: {
+    border: "1px solid #e2e8f0",
+    borderRadius: 9,
+    padding: 10,
+    marginBottom: 9,
+    background: "#f8fafc",
+  },
+  debugChoice: {
+    flex: 1,
+    border: "none",
+    borderRadius: 6,
+    padding: "7px 8px",
+    fontSize: 10,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  debugSelect: {
+    minWidth: 0,
+    padding: "7px 8px",
+    borderRadius: 6,
+    border: "1px solid #cbd5e1",
+    background: "#fff",
+    color: "#334155",
+    fontSize: 11,
+  },
+  debugSpeedBtn: {
+    flex: 1,
+    border: "none",
+    borderRadius: 6,
+    padding: "8px 6px",
+    fontSize: 11,
+    fontWeight: 900,
+    cursor: "pointer",
+  },
+  debugPrimaryBtn: {
+    width: "100%",
+    border: "none",
+    borderRadius: 7,
+    background: "#4f46e5",
+    color: "#fff",
+    padding: "9px 10px",
+    fontSize: 11,
+    fontWeight: 900,
+    cursor: "pointer",
+  },
+  debugSecondaryBtn: {
+    width: "100%",
+    border: "1px solid #6366f1",
+    borderRadius: 7,
+    background: "#eef2ff",
+    color: "#4338ca",
+    padding: "9px 10px",
+    fontSize: 11,
+    fontWeight: 900,
+    cursor: "pointer",
+    marginTop: 8,
+  },
+  debugStopBtn: {
+    flex: 1,
+    width: "100%",
+    border: "none",
+    borderRadius: 7,
+    background: "#dc2626",
+    color: "#fff",
+    padding: "9px 10px",
+    fontSize: 11,
+    fontWeight: 900,
+    cursor: "pointer",
+  },
+  debugCancelBtn: {
+    flex: 1,
+    border: "1px solid #cbd5e1",
+    borderRadius: 7,
+    background: "#fff",
+    color: "#475569",
+    padding: "9px 10px",
+    fontSize: 11,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  debugConfirmBox: {
+    border: "1px solid #fbbf24",
+    borderRadius: 8,
+    background: "#fffbeb",
+    color: "#92400e",
+    padding: 10,
+    fontSize: 11,
+    fontWeight: 700,
+  },
+  debugMeta: {
+    color: "#64748b",
+    fontSize: 10,
+    fontFamily: "monospace",
+    lineHeight: 1.5,
+    wordBreak: "break-all",
+  },
+  debugMessage: {
+    borderRadius: 7,
+    background: "#f1f5f9",
+    padding: "8px 10px",
+    fontSize: 11,
+    fontWeight: 700,
+    marginBottom: 9,
+  },
+  debugDiagnostics: {
+    border: "1px solid #c7d2fe",
+    borderRadius: 9,
+    background: "#eef2ff",
+    padding: 10,
   },
   trajectoryTab: {
     display: "flex",

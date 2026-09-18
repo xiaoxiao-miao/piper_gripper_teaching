@@ -11,12 +11,26 @@ DEFAULT_MANIFEST: dict[str, Any] = {
     "version": 1,
     "cameras": [
         {
+            "id": "polarizer",
+            "label": "FLIR Polarization Cam",
+            "type": "spinnaker",
+            "role": "polarization",
+            "enabled": True,
+            "device": "auto",
+            "fps": 15,
+            "streams": ["color", "aolp", "dolp", "grid", "stokes"],
+            "legacy_id": "polarizer",
+            "aliases": [],
+            "export_presets": ["default", "all", "debug"],
+        },
+        {
             "id": "cam0",
             "label": "Cam0 Ego",
             "type": "opencv",
             "role": "ego",
             "enabled": True,
             "device": "auto:C270:0",
+            "fps": 15,
             "streams": ["color"],
             "legacy_id": "webcam_0",
             "aliases": ["webcam_0"],
@@ -29,6 +43,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
             "role": "overview",
             "enabled": True,
             "device": "auto:C270:1",
+            "fps": 15,
             "streams": ["color"],
             "legacy_id": "webcam_1",
             "aliases": ["webcam_1"],
@@ -61,6 +76,10 @@ def _normalize_camera(cam: dict[str, Any]) -> dict[str, Any]:
     out["role"] = str(out.get("role", out["id"])).strip()
     out["enabled"] = bool(out.get("enabled", True))
     out["device"] = str(out.get("device", "auto"))
+    try:
+        out["fps"] = max(1, int(out.get("fps", 30)))
+    except (TypeError, ValueError):
+        out["fps"] = 30
     streams = out.get("streams", ["color"])
     out["streams"] = [str(s) for s in streams] if isinstance(streams, list) else ["color"]
     legacy_id = out.get("legacy_id")
@@ -176,7 +195,9 @@ def video_file_name(cam: dict[str, Any], stream: str = "color") -> str:
     legacy = legacy_id_for(cam)
     if cam["type"] == "realsense" or legacy == "realsense":
         return "video_depth.mp4" if stream == "depth" else "video.mp4"
-    return f"video_{legacy}.mp4"
+    if stream == "color":
+        return f"video_{legacy}.mp4"
+    return f"video_{legacy}_{stream}.mp4"
 
 
 def export_cameras(preset: str = "default", manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]:

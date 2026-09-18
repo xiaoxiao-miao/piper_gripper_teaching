@@ -165,7 +165,7 @@ export function EpisodeCollectionItem({
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={styles.thumbTitleRow}>
           <span style={styles.epId}>{ep.episode_id.slice(-22)}</span>
-          {ep.has_postprocess && <span title="postprocess edit" style={styles.postprocessBadge}>Trim/Mask</span>}
+          {ep.has_postprocess && <span title="postprocess edit" style={styles.postprocessBadge}>Export edit</span>}
           <StatusBadge success={ep.success} long />
         </div>
         <div style={styles.thumbTask}>{ep.task || "unspecified"}</div>

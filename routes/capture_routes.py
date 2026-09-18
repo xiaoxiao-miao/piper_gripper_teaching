@@ -75,7 +75,8 @@ def return_home_direct():
 def replay_start():
     data = request.get_json(silent=True) or {}
     speed = data.get("speed_scale")
-    return jsonify(_ctrl().start_replay(speed_scale=speed))
+    result = _ctrl().start_replay(speed_scale=speed)
+    return jsonify(result), (200 if result.get("ok") else 409)
 
 
 @bp.post("/replay/stop")

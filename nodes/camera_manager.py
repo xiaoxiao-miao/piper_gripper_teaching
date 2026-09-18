@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from nodes.realsense_node import RealsenseCapture
 from nodes.webcam_node import WebcamCapture, discover_webcams
+from nodes.spinnaker_node import SpinnakerCapture
 from camera_manifest import camera_aliases, legacy_id_for, load_manifest, resolve_camera_id
 
 
@@ -37,6 +38,7 @@ class CameraManager:
         self.manifest = manifest or load_manifest()
         self.realsense: Optional[RealsenseCapture] = None
         self.webcams: list[WebcamCapture] = []
+        self.spinnakers: list[SpinnakerCapture] = []
         self._camera_entries: dict[str, dict] = {}
         self._captures: dict[str, object] = {}
         self._aliases: dict[str, str] = {}
@@ -82,7 +84,15 @@ class CameraManager:
                 if not dev_path:
                     print(f"[CameraManager] {cam_id}: no OpenCV device resolved")
                     continue
-                wc = WebcamCapture(device_path=dev_path, name=legacy_id_for(entry))
+                try:
+                    target_fps = max(1, int(entry.get("fps", 30)))
+                except (TypeError, ValueError):
+                    target_fps = 30
+                wc = WebcamCapture(
+                    device_path=dev_path,
+                    name=legacy_id_for(entry),
+                    target_fps=target_fps,
+                )
                 ok = wc.start_stream()
                 if ok:
                     self.webcams.append(wc)
@@ -91,12 +101,50 @@ class CameraManager:
                     print(f"[CameraManager] {cam_id}: webcam connected ({dev_path})")
                 else:
                     print(f"[CameraManager] {cam_id} ({dev_path}): failed, skipping")
+                continue
+
+            if entry.get("type") == "spinnaker":
+                serial = self._resolve_spinnaker_serial(entry)
+                try:
+                    target_fps = max(1, int(entry.get("fps", 15)))
+                except (TypeError, ValueError):
+                    target_fps = 15
+                sc = SpinnakerCapture(
+                    serial=serial,
+                    name=legacy_id_for(entry),
+                    target_fps=target_fps,
+                )
+                ok = sc.start_stream()
+                if ok:
+                    self.spinnakers.append(sc)
+                    self._captures[cam_id] = sc
+                    any_ok = True
+                    print(f"[CameraManager] {cam_id}: Spinnaker camera connected (serial={serial or 'auto'})")
+                else:
+                    print(f"[CameraManager] {cam_id}: Spinnaker camera not available")
 
         self._connected = any_ok
         return any_ok
 
+    @staticmethod
+    def _resolve_spinnaker_serial(entry: dict) -> Optional[str]:
+        device = str(entry.get("device", "auto"))
+        if device.startswith("serial:"):
+            return device[len("serial:"):]
+        return None
+
     def _resolve_opencv_device(self, entry: dict, auto_cache: dict) -> Optional[str]:
         device = str(entry.get("device", "auto"))
+        if device.startswith("/dev/") and "*" in device:
+            import glob
+            # PCI-prefix glob: e.g. /dev/v4l/by-path/pci-0000:65:00.3-usb-*-video-index0
+            matches = sorted(glob.glob(device))
+            if not matches:
+                print(f"[CameraManager] glob '{device}' matched nothing")
+                return None
+            resolved = matches[0]
+            print(f"[CameraManager] glob '{device}' → {resolved}")
+            return resolved
         if device.startswith("/dev/"):
             return device
         if not device.startswith("auto"):
@@ -117,6 +165,9 @@ class CameraManager:
         for wc in self.webcams:
             wc.stop_stream()
         self.webcams = []
+        for sc in self.spinnakers:
+            sc.stop_stream()
+        self.spinnakers = []
         self._captures = {}
         self._connected = False
 
@@ -130,6 +181,8 @@ class CameraManager:
             self.realsense.start_recording(episode_dir)
         for wc in self.webcams:
             wc.start_recording(episode_dir)
+        for sc in self.spinnakers:
+            sc.start_recording(episode_dir)
 
     def stop_all_recording(self) -> dict:
         """
@@ -148,16 +201,17 @@ class CameraManager:
     # Live MJPEG (per camera)
     # ─────────────────────────────────────────────────────────────────
 
-    def get_jpeg_bytes(self, cam_id: str = "primary", quality: int = 70) -> Optional[bytes]:
+    def get_jpeg_bytes(self, cam_id: str = "primary", quality: int = 70, mode: str = "rgb") -> Optional[bytes]:
         """
         cam_id: 'primary' | manifest id | legacy alias | '<camera_id>_depth'
         'primary': 첫 번째 available color camera
+        mode: SpinnakerCapture 전용 view mode ('rgb'|'aolp'|'dolp'|'grid'|'stokes') — 다른 캡처 타입은 무시.
         """
         if cam_id == "primary":
             for entry in self.manifest.get("cameras", []):
                 capture = self._captures.get(entry["id"])
                 if capture and "color" in entry.get("streams", []):
-                    return capture.get_jpeg_bytes(quality)
+                    return self._get_jpeg_from_capture(capture, quality, mode)
             return None
 
         if cam_id.endswith("_depth"):
@@ -170,11 +224,43 @@ class CameraManager:
 
         resolved = self._aliases.get(cam_id) or resolve_camera_id(cam_id, self.manifest)
         capture = self._captures.get(resolved) if resolved else None
-        return capture.get_jpeg_bytes(quality) if capture else None
+        return self._get_jpeg_from_capture(capture, quality, mode) if capture else None
+
+    @staticmethod
+    def _get_jpeg_from_capture(capture, quality: int, mode: str) -> Optional[bytes]:
+        if isinstance(capture, SpinnakerCapture):
+            return capture.get_jpeg_bytes(quality, mode)
+        return capture.get_jpeg_bytes(quality)
 
     # ─────────────────────────────────────────────────────────────────
     # Status
     # ─────────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────────
+    # Controls (exposure / gain 등 — 지원하는 캡처 타입만)
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_camera_controls(self, cam_id: str) -> dict:
+        resolved = self._aliases.get(cam_id) or resolve_camera_id(cam_id, self.manifest)
+        capture = self._captures.get(resolved) if resolved else None
+        if capture and hasattr(capture, "get_controls"):
+            return capture.get_controls()
+        return {}
+
+    def set_camera_controls(self, cam_id: str, **kwargs) -> dict:
+        resolved = self._aliases.get(cam_id) or resolve_camera_id(cam_id, self.manifest)
+        capture = self._captures.get(resolved) if resolved else None
+        if capture and hasattr(capture, "set_controls"):
+            return capture.set_controls(**kwargs)
+        return {"error": f"camera '{cam_id}' not found or does not support controls"}
+
+    def get_raw_bundle_pngs(self, cam_id: str) -> Optional[dict]:
+        """편광 카메라 전용: Stokes/AoLP/DoLP raw PNG 묶음. 지원 안 하면 None."""
+        resolved = self._aliases.get(cam_id) or resolve_camera_id(cam_id, self.manifest)
+        capture = self._captures.get(resolved) if resolved else None
+        if capture and hasattr(capture, "get_raw_bundle_pngs"):
+            return capture.get_raw_bundle_pngs()
+        return None
 
     def get_status(self) -> dict:
         """전체 카메라 상태 dict. 프론트엔드 camera_state 이벤트용."""
@@ -211,7 +297,9 @@ class CameraManager:
         """녹화/스트리밍 가능한 카메라가 1대 이상인지."""
         if self.realsense and self.realsense._available:
             return True
-        return any(wc._available for wc in self.webcams)
+        if any(wc._available for wc in self.webcams):
+            return True
+        return any(sc._available for sc in self.spinnakers)
 
     # ─────────────────────────────────────────────────────────────────
     # Backward-compat shim (controller가 단일 RealsenseCapture 처럼 쓰는 곳)

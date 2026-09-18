@@ -17,6 +17,7 @@ Episode 관리 API
   GET    /api/episodes/<episode_id>/takes/<take>/joints      ← joint CSV data (teach/executed/command)
   GET    /api/episodes/<episode_id>/takes/<take>/trajectory  ← FK trajectory (ee + link positions)
   GET    /api/episodes/<episode_id>/frame/<frame_idx>        ← 최신 take의 frame
+  POST   /api/episodes/<episode_id>/takes/<take>/regenerate_videos  ← 카메라 영상 재생성
 """
 
 import csv as csv_module
@@ -45,7 +46,10 @@ def _take_dir(episode_id: str, take: Optional[str] = None) -> Optional[str]:
     mgr = _mgr()
     if take:
         from config import DATASET_PATH
-        d = os.path.join(DATASET_PATH, episode_id, "takes", take)
+        dataset_root = os.path.realpath(DATASET_PATH)
+        d = os.path.realpath(os.path.join(dataset_root, episode_id, "takes", take))
+        if os.path.commonpath([dataset_root, d]) != dataset_root:
+            return None
         return d if os.path.isdir(d) else None
     return mgr.get_latest_take_dir(episode_id)
 
@@ -203,7 +207,20 @@ def _take_completeness(take_dir: str, ep_success: bool | None) -> dict:
 @bp.get("")
 def list_episodes():
     from config import DATASET_PATH
-    episodes = _mgr().list_episodes()
+    paged = "page" in request.args or "page_size" in request.args
+    page = max(1, request.args.get("page", default=1, type=int) or 1)
+    page_size = min(100, max(1, request.args.get("page_size", default=24, type=int) or 24))
+    if paged:
+        total = _mgr().count_episodes()
+        episodes = _mgr().list_episodes(
+            offset=(page - 1) * page_size,
+            limit=page_size,
+            lightweight=True,
+        )
+    else:
+        # Backward compatibility for scripts that still expect a bare array.
+        total = None
+        episodes = _mgr().list_episodes()
     # 각 에피소드의 마지막 take edit_meta.json 확인 → has_postprocess 플래그
     for ep in episodes:
         ep_id = ep.get("episode_id", "")
@@ -220,7 +237,11 @@ def list_episodes():
                     try:
                         with open(em_path) as f:
                             em = json.load(f)
-                        has_pp = bool(em.get("trim", {}).get("enabled")) or bool(em.get("mask", {}).get("enabled"))
+                        has_pp = (
+                            bool(em.get("trim", {}).get("enabled"))
+                            or bool(em.get("mask", {}).get("enabled"))
+                            or em.get("timing", {}).get("mode") == "physical_replay"
+                        )
                     except (OSError, json.JSONDecodeError):
                         pass
         ep["has_postprocess"] = has_pp
@@ -228,7 +249,11 @@ def list_episodes():
             td = os.path.join(takes_dir, latest_take)
             preview_path = _preview_video_path(td)
             ep["preview_video_url"] = f"/api/episodes/{ep_id}/preview_video" if preview_path else None
-            ep["duration_s"] = _video_duration_s(preview_path) if preview_path else None
+            # Opening every video with OpenCV dominated large-dataset list
+            # latency.  Paged clients load duration only from joint/video detail.
+            ep["duration_s"] = (
+                None if paged else _video_duration_s(preview_path) if preview_path else None
+            )
             ep["completeness"] = _take_completeness(td, ep.get("success"))
             latest_take_info = next((t for t in ep.get("takes", []) if t.get("take") == latest_take), None)
             ep["review_issues"] = (latest_take_info or {}).get("review_issues", [])
@@ -242,7 +267,15 @@ def list_episodes():
             }
             ep["review_issues"] = []
             ep["review_issue_count"] = 0
-    return jsonify(episodes)
+    if not paged:
+        return jsonify(episodes)
+    return jsonify({
+        "items": episodes,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": page * page_size < total,
+    })
 
 
 @bp.get("/<episode_id>")
@@ -310,6 +343,77 @@ def delete_take(episode_id: str, take: str):
     if not ok:
         return abort(404)
     return jsonify({"ok": True})
+
+
+# ── Dataset robot debug replay (no camera recording) ─────────────────
+
+@bp.get("/debug_replay/status")
+def debug_replay_status():
+    return jsonify(_ctrl().get_debug_replay_status())
+
+
+@bp.post("/<episode_id>/takes/<take>/debug_replay/load")
+def debug_replay_load(episode_id: str, take: str):
+    take_dir = _take_dir(episode_id, take)
+    if not take_dir:
+        return jsonify({"ok": False, "reason": "Episode take not found"}), 404
+    data = request.get_json(silent=True) or {}
+    result = _ctrl().load_debug_trajectory(
+        take_dir=take_dir,
+        episode_id=episode_id,
+        take=take,
+        source=str(data.get("source", "teach")),
+    )
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@bp.post("/debug_replay/return")
+def debug_replay_return():
+    result = _ctrl().return_debug_replay_to_start()
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@bp.post("/debug_replay/start")
+def debug_replay_start():
+    data = request.get_json(silent=True) or {}
+    result = _ctrl().start_debug_replay(data.get("speed_scale", 0.5))
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@bp.post("/debug_replay/stop")
+def debug_replay_stop():
+    result = _ctrl().stop_debug_replay()
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@bp.post("/debug_replay/sequence/start")
+def debug_replay_sequence_start():
+    data = request.get_json(silent=True) or {}
+    raw_items = data.get("items") or []
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            return jsonify({"ok": False, "reason": "Each sequence item must be an object"}), 400
+        episode_id = str(raw.get("episode_id", ""))
+        take = str(raw.get("take", ""))
+        take_dir = _take_dir(episode_id, take)
+        if not take_dir:
+            return jsonify({
+                "ok": False,
+                "reason": f"Episode take not found: {episode_id}/{take}",
+            }), 404
+        items.append({
+            "episode_id": episode_id,
+            "take": take,
+            "take_dir": take_dir,
+            "source": str(raw.get("source", "teach")),
+        })
+    result = _ctrl().start_debug_sequence(
+        items=items,
+        cycles=data.get("cycles", 1),
+        speed_scale=data.get("speed_scale", 0.3),
+    )
+    return jsonify(result), (200 if result.get("ok") else 409)
 
 
 # ── Dataset QA / review issues ────────────────────────────────────────
@@ -382,6 +486,7 @@ def _load_edit_meta(episode_id: str, take: str) -> tuple[str, dict] | tuple[None
         meta = {}
     meta.setdefault("trim", {"enabled": False, "cut_t": None, "margin": 1.0})
     meta.setdefault("mask", {"enabled": False, "camera_id": default_mask_camera_id() or "", "polygon": [], "fill": "black"})
+    meta.setdefault("timing", {"mode": "teaching_normalized"})
     return path, meta
 
 
@@ -620,6 +725,17 @@ def get_take_video_camera_stream(episode_id: str, take: str, cam_id: str, stream
     return send_file(path, mimetype="video/mp4")
 
 
+@bp.post("/<episode_id>/takes/<take>/regenerate_videos")
+def regenerate_take_videos(episode_id: str, take: str):
+    """이미 완료된 take의 카메라 영상을 다시 생성 (예: 옛날 편광 카메라 녹화에
+    AoLP/DoLP/2x2 grid 뷰를 새로 채워넣을 때 — 호환 재구성)."""
+    td = _take_dir(episode_id, take)
+    if not td:
+        return abort(404)
+    result = _mgr().regenerate_camera_videos(episode_id, take)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
 @bp.get("/<episode_id>/frame/<int:frame_idx>")
 def get_frame(episode_id: str, frame_idx: int):
     td = _take_dir(episode_id)
@@ -730,6 +846,13 @@ def export_lerobot():
         preset = data.get("preset", data.get("export_preset", "default"))
         mask_mode = data.get("mask_mode", "edit")
         mask_fill_color = data.get("mask_fill_color", POSTPROCESS_DEFAULT_MASK_FILL_COLOR)
+        preserve_source_indices = bool(data.get("preserve_source_indices", False))
+        include_default_excluded = bool(data.get("include_default_excluded", False))
+        if preserve_source_indices and not include_default_excluded:
+            return jsonify({
+                "ok": False,
+                "error": "preserve_source_indices requires include_default_excluded",
+            }), 400
         convert_episodes(
             episode_ids,
             DATASET_PATH,
@@ -737,6 +860,8 @@ def export_lerobot():
             export_preset=preset,
             mask_mode=mask_mode,
             mask_fill_color=mask_fill_color,
+            preserve_source_indices=preserve_source_indices,
+            include_default_excluded=include_default_excluded,
         )
 
         buf = io.BytesIO()
@@ -938,9 +1063,12 @@ def get_edit_meta(episode_id: str, take: str):
     path = os.path.join(td, "edit_meta.json")
     if not os.path.exists(path):
         return jsonify({"trim": {"enabled": False, "cut_t": None, "margin": 1.0},
-                        "mask": {"enabled": False, "camera_id": default_mask_camera_id() or "", "polygon": [], "fill": "black"}})
+                        "mask": {"enabled": False, "camera_id": default_mask_camera_id() or "", "polygon": [], "fill": "black"},
+                        "timing": {"mode": "teaching_normalized"}})
     with open(path) as f:
-        return jsonify(json.load(f))
+        meta = json.load(f)
+    meta.setdefault("timing", {"mode": "teaching_normalized"})
+    return jsonify(meta)
 
 
 @bp.put("/<episode_id>/takes/<take>/edit_meta")
@@ -952,6 +1080,10 @@ def put_edit_meta(episode_id: str, take: str):
     data = request.get_json(silent=True)
     if data is None:
         return abort(400)
+    timing_mode = data.get("timing", {}).get("mode", "teaching_normalized")
+    if timing_mode not in ("teaching_normalized", "physical_replay"):
+        return jsonify({"ok": False, "error": "invalid timing mode"}), 400
+    data.setdefault("timing", {})["mode"] = timing_mode
     path = os.path.join(td, "edit_meta.json")
     with open(path, "w") as f:
         json.dump(data, f, indent=2)

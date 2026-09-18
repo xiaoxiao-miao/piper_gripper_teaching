@@ -5,7 +5,7 @@
  * Row B: Step Card    — 현재 단계별 가이드 + 액션 버튼 (좌: 정보, 우: 버튼)
  * Row C: Event Log    — 최근 이벤트 스트립 (최대 5줄)
  */
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import ReviewEpisodeModal from "../components/ReviewEpisodeModal";
 import type { AppMode, RobotState, CameraState, EventLog, SaveStep } from "../types";
 
@@ -26,6 +26,11 @@ type CamId = string;
 
 const TEACH_DISABLE_DELAY = 5; // seconds
 
+const fmtUs = (us?: number) => {
+  if (us === undefined || us === null || Number.isNaN(us)) return "—";
+  return us >= 1000 ? `${(us / 1000).toFixed(1)}ms` : `${Math.round(us)}µs`;
+};
+
 const post = (path: string, body?: object) =>
   fetch(path, {
     method: "POST",
@@ -41,7 +46,9 @@ const STEP_INFO: Record<AppMode, { badge: string; title: string; guide: string }
   READY:            { badge: "1 · Ready Pose", title: "System Ready",         guide: "Confirm the current pose as the teaching start position." },
   CALIBRATING:      { badge: "Calibration", title: "Joint Range Calibration", guide: "Move each joint to its min and max safe position, then finish." },
   TEACH_READY:      { badge: "2 · Teaching", title: "Ready to Teach",         guide: "Describe the task, then guide the arm along the desired path." },
+  TEACH_STARTING:   { badge: "2 · Teaching", title: "Preparing Freedrive",    guide: "Waiting for verified six-axis motor release." },
   TEACH_RECORDING:  { badge: "2 · Teaching", title: "Teaching in Progress",   guide: "Motors release in 5 s. Guide the arm along the path." },
+  TEACH_STOPPING:   { badge: "2 · Teaching", title: "Stopping Teaching",      guide: "Re-arming all axes and preserving the recorded trajectory." },
   TRAJECTORY_CHECK: { badge: "3 · Return Home", title: "Trajectory Recorded", guide: "Return to start position before replay recording." },
   RETURN_HOME:      { badge: "3 · Return Home", title: "Returning Home",      guide: "Robot is moving to the start position. Stay clear." },
   REPLAY_READY:     { badge: "4 · Replay & Record", title: "Ready to Record", guide: "Set replay speed, then start the capture." },
@@ -50,16 +57,24 @@ const STEP_INFO: Record<AppMode, { badge: string; title: string; guide: string }
   REVIEW:           { badge: "5 · Review",  title: "Episode Complete",        guide: "Review the new take, then save, retake, or discard it." },
   SAVED:            { badge: "5 · Review",  title: "Episode Saved",           guide: "Start a new episode or add another take." },
   DISCARDED:        { badge: "5 · Review",  title: "Episode Discarded",       guide: "Start a new episode to continue." },
+  DEBUG_RETURN:     { badge: "Dataset Debug", title: "Returning to Debug Start", guide: "Robot is moving to the selected saved trajectory start." },
+  DEBUG_REPLAY:     { badge: "Dataset Debug", title: "Debug Replay Running", guide: "No cameras are recording. Results are saved under debug_replays." },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function CapturePage({
   mode, availableActions, robot, camera, events, episodeId, saveSteps = [],
 }: Props) {
-  const [selectedCam, setSelectedCam] = useState<CamId>("cam0");
+  const [selectedCam, setSelectedCam] = useState<CamId>("polarizer");  // 디버깅 편의상 기본 선택
+  const [polarizerMode, setPolarizerMode] = useState<"rgb" | "aolp" | "dolp" | "grid" | "stokes">("rgb");
+  const [autoExposure, setAutoExposureUI] = useState(true);
+  const [exposureEv, setExposureEv] = useState(0);
+  const [draggingExposure, setDraggingExposure] = useState(false);
   const [task, setTask] = useState("pick red block and place in bowl");
   const [speedScale, setSpeedScale] = useState(0.5);
   const [confirmReplay, setConfirmReplay] = useState(false);
+  const [replayStarting, setReplayStarting] = useState(false);
+  const [replayMessage, setReplayMessage] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [reviewDismissed, setReviewDismissed] = useState(false);
   const [calibLimits, setCalibLimits] = useState<Record<
@@ -69,6 +84,7 @@ export default function CapturePage({
   useEffect(() => { setIsSaving(false); }, [mode]);
   useEffect(() => {
     if (mode === "REVIEW" || mode === "PROCESSING") setReviewDismissed(false);
+    if (mode !== "REPLAY_READY") setReplayMessage("");
   }, [mode]);
 
   const can = (a: string) => availableActions.includes(a);
@@ -79,12 +95,34 @@ export default function CapturePage({
   const handleStopTeach   = () => { setIsSaving(true); post("/api/teach/stop"); };
   const handleReturnHome       = () => post("/api/home");
   const handleReturnHomeDirect = () => post("/api/home/direct");
-  const handleStartReplay = () => {
+  const handleStartReplay = async () => {
     setConfirmReplay(false);
-    post("/api/replay/start", { speed_scale: speedScale });
+    setReplayStarting(true);
+    setReplayMessage("");
+    try {
+      const response = await post("/api/replay/start", { speed_scale: speedScale });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        const recommended = Number(data.recommended_max_speed);
+        if (Number.isFinite(recommended) && recommended > 0) {
+          setSpeedScale(recommended);
+        }
+        setReplayMessage(data.reason || `Replay start failed (${response.status})`);
+      } else if (data.speed_adjusted) {
+        setReplayMessage(
+          `Safety limit applied: ${Math.round(Number(data.speed_scale_applied) * 100)}%`,
+        );
+      }
+    } catch {
+      setReplayMessage("Replay start request failed. Check the backend connection.");
+    } finally {
+      setReplayStarting(false);
+    }
   };
   const handleStopReplay  = () => { setIsSaving(true); post("/api/replay/stop"); };
+  const handleStopDebugReplay = () => post("/api/episodes/debug_replay/stop");
   const handleHold        = () => post("/api/hold");
+  const handleResumeCalibration = () => post("/api/robot/calibrate/resume");
   const handleGripSet     = (pct: number) => post("/api/robot/gripper/set", { pct });
   const handleGripClose   = () => post("/api/robot/gripper/close");
   const handleCalibStart  = () => post("/api/robot/calibrate/start");
@@ -102,10 +140,86 @@ export default function CapturePage({
   };
 
   const recentEvents = useMemo(() => [...events].reverse().slice(0, 5), [events]);
+  const calibrationReady =
+    robot.calibration_valid?.length === 6 && robot.calibration_valid.every(Boolean);
+  const calibrationHeld = Boolean(robot.motor_enable_status?.some(Boolean));
 
   const showStream = mode !== "IDLE" && mode !== "CONNECTING";
-  const mainUrl    = `${FLASK_HTTP_ORIGIN}/stream/camera/${selectedCam}`;
+  const polarizerInfo = camera.cameras?.[selectedCam];
+  const isPolarizerCam = polarizerInfo?.type === "spinnaker";
+  const mainUrl    = isPolarizerCam
+    ? `${FLASK_HTTP_ORIGIN}/stream/camera/${selectedCam}?mode=${polarizerMode}`
+    : `${FLASK_HTTP_ORIGIN}/stream/camera/${selectedCam}`;
   const info       = STEP_INFO[mode];
+
+  // MJPEG(multipart/x-mixed-replace)는 <img key>로 리마운트해도 브라우저가 이전
+  // 커넥션을 안 닫는 경우가 있어 origin당 6개 연결 제한에 걸려 다른 API 요청까지
+  // 막히는 문제가 있었음 — 같은 <img> 노드를 재사용하며 src=""로 확실히 끊고 재연결.
+  const mainImgRef = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    const img = mainImgRef.current;
+    if (!img || !showStream) return;
+    img.src = "";
+    img.src = mainUrl;
+  }, [mainUrl, showStream]);
+
+  // ── Polarizer exposure control (EV 스케일 슬라이더) ──────────────────
+  // 하드웨어 최대(최대 30초)까지 열어뒀더니 AcquisitionFrameRate와 정면 충돌해
+  // 프레임이 깨지는 사고가 있었음 — 15fps 힌트의 4배로 다시 제한 (힌트 자체보다는
+  // 훨씬 넓게 다룰 수 있으면서, 초 단위로 폭주하진 않게).
+  const expMinUs = polarizerInfo?.exposure_us_min ?? 20;
+  const expHintUs = polarizerInfo?.exposure_us_max_hint_for_target_fps;
+  const expMaxUs = Math.max(
+    expMinUs * 2,
+    Math.min(polarizerInfo?.exposure_us_max_hw ?? Infinity, (expHintUs ?? expMinUs * 2) * 4)
+  );
+  const evMax = Math.log2(expMaxUs / expMinUs);
+  const previewExposureUs = Math.round(expMinUs * Math.pow(2, exposureEv));
+
+  // 카메라당 한 번만 서버 값으로 동기화 — 매 폴링(10Hz)마다 하면 사용자가 막
+  // 조작한 로컬 상태를 곧바로 덮어써서 "버튼이 반응 안 하는" 것처럼 보임.
+  const syncedExposureCamRef = React.useRef<string | null>(null);
+  useEffect(() => {
+    if (!isPolarizerCam || draggingExposure) return;
+    if (syncedExposureCamRef.current === selectedCam) return;
+    const curUs = polarizerInfo?.exposure_us;
+    if (curUs === undefined) return; // camera_state 아직 안 옴 — 다음 폴링 때 재시도
+    if (polarizerInfo?.exposure_auto) setAutoExposureUI(polarizerInfo.exposure_auto !== "Off");
+    if (expMinUs > 0 && curUs > 0) setExposureEv(Math.log2(curUs / expMinUs));
+    syncedExposureCamRef.current = selectedCam;
+  }, [selectedCam, isPolarizerCam, polarizerInfo?.exposure_us, polarizerInfo?.exposure_auto, draggingExposure, expMinUs]);
+
+  const putCameraControls = (camId: string, body: object) =>
+    fetch(`/api/cameras/${camId}/controls`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  const handleAutoExposureToggle = () => {
+    const next = !autoExposure;
+    setAutoExposureUI(next);
+    putCameraControls(selectedCam, { exposure_auto: next });
+  };
+
+  const commitExposureEv = (ev: number) => {
+    putCameraControls(selectedCam, { exposure_us: Math.round(expMinUs * Math.pow(2, ev)) });
+  };
+
+  // ── Screenshot ────────────────────────────────────────────────────
+  const [screenshotFlash, setScreenshotFlash] = useState(false);
+  const handleScreenshot = () => {
+    const body: { cam_id: string; mode?: string } = { cam_id: selectedCam };
+    if (isPolarizerCam) body.mode = polarizerMode;
+    fetch("/api/screenshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(() => {
+      setScreenshotFlash(true);
+      setTimeout(() => setScreenshotFlash(false), 900);
+    });
+  };
   const cameraTabs = useMemo(() => {
     const cams = Object.values(camera.cameras ?? {}).flatMap(c => {
       if (c.enabled === false) return [];
@@ -120,6 +234,7 @@ export default function CapturePage({
     });
     if (!cams.length) {
       return [
+        { id: "polarizer", label: "Polarizer", info: undefined, stream: "color" },
         { id: "cam0", label: "Cam0", info: undefined, stream: "color" },
         { id: "cam1", label: "Cam1", info: undefined, stream: "color" },
         { id: "realsense", label: "RealSense", info: undefined, stream: "color" },
@@ -170,17 +285,92 @@ export default function CapturePage({
         {showStream ? (
           <>
             <img
-              key={selectedCam}
-              src={mainUrl}
+              ref={mainImgRef}
               alt="Camera"
               style={styles.mainImg}
-              onError={e => {
-                const img = e.currentTarget;
-                setTimeout(() => { img.src = `${mainUrl}?t=${Date.now()}`; }, 3000);
+              onError={() => {
+                setTimeout(() => {
+                  const img = mainImgRef.current;
+                  if (!img) return;
+                  img.src = "";       // 이전 커넥션 확실히 종료 후
+                  img.src = mainUrl;  // 재연결
+                }, 3000);
               }}
             />
             {mode === "REPLAY_RECORDING" && <div style={styles.recBadge}>● REC</div>}
             {mode === "TEACH_RECORDING"  && <div style={styles.teachBadge}>TEACH</div>}
+            <button onClick={handleScreenshot} style={styles.screenshotBtn}>
+              {screenshotFlash ? "✓ Saved" : "📷 Screenshot"}
+            </button>
+            {isPolarizerCam && (
+              <div style={styles.polarizerModeOverlay}>
+                <div style={styles.polarizerInfoBox}>
+                  <div>{polarizerInfo?.resolution ?? "—"}</div>
+                  <div>{polarizerInfo?.fps ?? "—"} fps</div>
+                  <div>{polarizerInfo?.pixel_format ?? "—"}</div>
+                  <div>shutter {fmtUs(polarizerInfo?.exposure_us)}</div>
+                  <div style={{ opacity: 0.65, fontSize: 10 }}>
+                    min {fmtUs(polarizerInfo?.exposure_us_min)} / max {fmtUs(polarizerInfo?.exposure_us_max_hw)}
+                  </div>
+                </div>
+
+                <div style={styles.polarizerInfoBox}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input type="checkbox" checked={autoExposure} onChange={handleAutoExposureToggle} />
+                    Auto Exposure
+                  </label>
+                  {!autoExposure && (
+                    <div style={{ marginTop: 6 }}>
+                      <input
+                        type="range"
+                        min={0}
+                        max={evMax}
+                        step={0.05}
+                        value={exposureEv}
+                        onMouseDown={() => setDraggingExposure(true)}
+                        onTouchStart={() => setDraggingExposure(true)}
+                        onChange={e => setExposureEv(parseFloat(e.target.value))}
+                        onMouseUp={e => {
+                          setDraggingExposure(false);
+                          commitExposureEv(parseFloat((e.target as HTMLInputElement).value));
+                        }}
+                        onTouchEnd={e => {
+                          setDraggingExposure(false);
+                          commitExposureEv(parseFloat((e.target as HTMLInputElement).value));
+                        }}
+                        style={{ width: "100%" }}
+                      />
+                      <div style={{ textAlign: "center" }}>{fmtUs(previewExposureUs)}</div>
+                      {expHintUs !== undefined && (
+                        <div style={{ fontSize: 9, opacity: 0.6, textAlign: "center" }}>
+                          15fps 안전 한계 ≈ {fmtUs(expHintUs)} (실측 아님, 위 fps로 실제 확인)
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {([
+                  { id: "rgb", label: "RGB" },
+                  { id: "aolp", label: "AoLP" },
+                  { id: "dolp", label: "DoLP" },
+                  { id: "grid", label: "2×2 Grid" },
+                  { id: "stokes", label: "S1/S2" },
+                ] as const).map(m => (
+                  <button
+                    key={m.id}
+                    onClick={() => setPolarizerMode(m.id)}
+                    style={{
+                      ...styles.polarizerModeBtn,
+                      background: polarizerMode === m.id ? "#0891b2" : "rgba(15,23,42,0.6)",
+                      border: polarizerMode === m.id ? "1px solid #22d3ee" : "1px solid rgba(255,255,255,0.25)",
+                    }}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </>
         ) : (
           <div style={styles.placeholder}>Camera stream will appear after connecting</div>
@@ -258,10 +448,10 @@ export default function CapturePage({
           )}
 
           {/* TEACH_RECORDING: countdown / free indicator */}
-          {mode === "TEACH_RECORDING" && <TeachIndicator />}
+          {mode === "TEACH_STARTING" && <TeachIndicator />}
 
           {/* REPLAY_RECORDING: progress circle */}
-          {mode === "REPLAY_RECORDING" && (
+          {(mode === "REPLAY_RECORDING" || mode === "DEBUG_REPLAY") && (
             <ReplayProgressCircle progress={robot.replay_progress ?? 0} />
           )}
         </div>
@@ -283,8 +473,16 @@ export default function CapturePage({
 
           {mode === "CALIBRATING" && (
             <>
-              <div style={styles.freeAlert}>✋ ARM IS FREE — guide freely</div>
-              <Btn label="Finish Calibration" onClick={handleCalibStop} primary disabled={!can("stop_calibration")} />
+              <div style={styles.freeAlert}>
+                {calibrationHeld ? "⏸ ARM IS HELD — resume to continue" : "✋ ARM IS FREE — guide freely"}
+              </div>
+              <div style={{ fontSize: 11, fontFamily: "monospace", color: "#64748b" }}>
+                {(robot.calibration_span ?? []).map((span, i) =>
+                  `J${i + 1}: ${span.toFixed(3)}${robot.calibration_valid?.[i] ? " ✓" : " ✗"}`
+                ).join(" · ")}
+              </div>
+              <Btn label="Finish Calibration" onClick={handleCalibStop} primary
+                disabled={!can("stop_calibration") || !calibrationReady} />
             </>
           )}
 
@@ -304,6 +502,10 @@ export default function CapturePage({
             </>
           )}
 
+          {mode === "TEACH_STOPPING" && (
+            <div style={styles.replayMessage}>Re-arming robot and saving teaching data…</div>
+          )}
+
           {mode === "TRAJECTORY_CHECK" && (
             <>
               <Btn label="↩ Return (Backtrace)" onClick={handleReturnHome} primary disabled={!can("return_home")} />
@@ -314,12 +516,15 @@ export default function CapturePage({
 
           {mode === "REPLAY_READY" && (
             <>
+              {replayMessage && (
+                <div style={styles.replayMessage}>{replayMessage}</div>
+              )}
               {!confirmReplay ? (
                 <Btn
                   label="Start Replay & Record"
                   onClick={() => setConfirmReplay(true)}
                   primary
-                  disabled={!can("start_replay")}
+                  disabled={!can("start_replay") || replayStarting}
                 />
               ) : (
                 <div style={styles.confirmBox}>
@@ -328,7 +533,7 @@ export default function CapturePage({
                   </div>
                   <div style={{ display: "flex", gap: 6 }}>
                     <Btn label="Cancel" onClick={() => setConfirmReplay(false)} />
-                    <Btn label="Confirm — Start" onClick={handleStartReplay} primary />
+                    <Btn label={replayStarting ? "Starting…" : "Confirm — Start"} onClick={handleStartReplay} primary disabled={replayStarting} />
                   </div>
                 </div>
               )}
@@ -342,6 +547,14 @@ export default function CapturePage({
               <GripperRow onSet={handleGripSet} onClose={handleGripClose} can={can} gripperRad={robot.gripper} />
               <Btn label="Stop Recording" onClick={handleStopReplay} primary disabled={!can("stop_replay")} />
             </>
+          )}
+
+          {mode === "DEBUG_RETURN" && (
+            <Btn label="Stop at Current Position" onClick={handleHold} danger />
+          )}
+
+          {mode === "DEBUG_REPLAY" && (
+            <Btn label="Stop Debug Replay" onClick={handleStopDebugReplay} danger />
           )}
 
           {(mode === "REVIEW" || mode === "SAVED" || mode === "DISCARDED") && (
@@ -369,7 +582,12 @@ export default function CapturePage({
           {/* Safety zone — hold always accessible when available */}
           {can("hold_position") && (
             <div style={styles.safetyZone}>
-              <Btn label="⚠ Hold" onClick={handleHold} danger size="sm" />
+              {mode === "CALIBRATING" && calibrationHeld ? (
+                <Btn label="▶ Resume Calibration (Release Arm)"
+                  onClick={handleResumeCalibration} size="sm" />
+              ) : (
+                <Btn label="⚠ Hold" onClick={handleHold} danger size="sm" />
+              )}
             </div>
           )}
         </div>
@@ -395,9 +613,9 @@ export default function CapturePage({
 
 const FLOW_STEPS: { label: string; modes: AppMode[] }[] = [
   { label: "Ready Pose", modes: ["IDLE", "CONNECTING", "READY", "CALIBRATING"] },
-  { label: "Teaching", modes: ["TEACH_READY", "TEACH_RECORDING"] },
+  { label: "Teaching", modes: ["TEACH_READY", "TEACH_STARTING", "TEACH_RECORDING", "TEACH_STOPPING"] },
   { label: "Return Home", modes: ["TRAJECTORY_CHECK", "RETURN_HOME"] },
-  { label: "Replay & Record", modes: ["REPLAY_READY", "REPLAY_RECORDING", "PROCESSING"] },
+  { label: "Replay & Record", modes: ["REPLAY_READY", "REPLAY_RECORDING", "PROCESSING", "DEBUG_RETURN", "DEBUG_REPLAY"] },
   { label: "Review", modes: ["REVIEW", "SAVED", "DISCARDED"] },
 ];
 
@@ -474,10 +692,10 @@ const teachStyles: Record<string, React.CSSProperties> = {
 };
 
 /**
- * GripperRow — 슬라이더(0 / 100%) 즉시 전송 (50% 단계 제거)
+ * GripperRow — 자주 쓰는 opening preset을 즉시 전송
  */
 const GRIPPER_OPEN_RAD = 0.07;
-const GRIPPER_SNAPS = [0, 100];
+const GRIPPER_SNAPS = [0, 50, 70, 100];
 
 function radToSnapPct(rad: number): number {
   const raw = Math.round((rad / GRIPPER_OPEN_RAD) * 100);
@@ -490,7 +708,7 @@ function GripperRow({
   onSet, onClose, can, gripperRad,
 }: { onSet: (pct: number) => void; onClose: () => void; can: (a: string) => boolean; gripperRad?: number }) {
   const [pct, setPct] = React.useState(() =>
-    gripperRad !== undefined ? radToSnapPct(gripperRad) : 100
+    gripperRad !== undefined ? radToSnapPct(gripperRad) : 70
   );
   const canOpen  = can("open_gripper");
   const canClose = can("close_gripper");
@@ -515,7 +733,7 @@ function GripperRow({
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <input
           type="range"
-          min={0} max={100} step={100}
+          min={0} max={100} step={5}
           value={pct}
           disabled={!canAny}
           onChange={e => handleChange(Number(e.target.value))}
@@ -527,9 +745,12 @@ function GripperRow({
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingLeft: 2, paddingRight: 36 }}>
         {SNAPS.map(v => (
-          <span key={v} style={{ fontSize: 10, color: v === pct ? "#15803d" : "#9ca3af", fontWeight: v === pct ? 700 : 400 }}>
+          <button key={v} type="button" disabled={!canAny} onClick={() => handleChange(v)} style={{
+            border: 0, background: "transparent", padding: "2px 3px", cursor: canAny ? "pointer" : "default",
+            fontSize: 10, color: v === pct ? "#15803d" : "#9ca3af", fontWeight: v === pct ? 700 : 400,
+          }}>
             {v}%
-          </span>
+          </button>
         ))}
       </div>
     </div>
@@ -772,6 +993,47 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 6, padding: "4px 10px",
     fontWeight: 700, fontSize: 13, letterSpacing: 1,
   },
+  screenshotBtn: {
+    position: "absolute",
+    top: 12, right: 12, zIndex: 3,
+    background: "rgba(15,23,42,0.7)",
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.3)",
+    borderRadius: 6,
+    padding: "6px 12px",
+    fontSize: 12,
+    fontWeight: 700,
+    cursor: "pointer",
+  } as React.CSSProperties,
+  polarizerModeOverlay: {
+    position: "absolute",
+    top: "50%", right: 12, zIndex: 2,
+    transform: "translateY(-50%)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  } as React.CSSProperties,
+  polarizerInfoBox: {
+    background: "rgba(15,23,42,0.6)",
+    border: "1px solid rgba(255,255,255,0.25)",
+    borderRadius: 6,
+    padding: "8px 12px",
+    color: "#e2e8f0",
+    fontSize: 11,
+    fontWeight: 600,
+    lineHeight: 1.6,
+    marginBottom: 4,
+    minWidth: 120,
+  } as React.CSSProperties,
+  polarizerModeBtn: {
+    padding: "6px 14px",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#fff",
+    backdropFilter: "blur(2px)",
+  } as React.CSSProperties,
   cameraTabs: {
     flexShrink: 0,
     display: "flex",
@@ -874,6 +1136,11 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 7,
     padding: "10px 12px",
     marginBottom: 5,
+  },
+  replayMessage: {
+    width: "100%", boxSizing: "border-box", border: "1px solid #fca5a5",
+    borderRadius: 7, background: "#fef2f2", color: "#b91c1c",
+    padding: "8px 10px", fontSize: 11, fontWeight: 700,
   },
   safetyZone: {
     borderTop: "1px solid #fee2e2",
