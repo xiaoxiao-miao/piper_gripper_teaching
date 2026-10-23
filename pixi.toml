@@ -1,0 +1,138 @@
+[workspace]
+name = "pipier_gripper_teaching"
+version = "0.1.0"
+description = "Piper Gripper Teaching ROS 2 Jazzy runtime (aligned with physical_ai_runtime stack)"
+channels = ["robostack-jazzy", "https://prefix.dev/gabriel-robotics", "nvidia", "conda-forge"]
+platforms = [{ platform = "linux-64", glibc = "2.35" }]
+
+# Conda owns numpy + opencv; never add them under [pypi-dependencies].
+# Stack versions (must stay in sync with physical_ai_runtime):
+#   Python 3.12.* | ROS 2 Jazzy | PyTorch >=2.9 + cu130
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+
+# ── CUDA 13.0 toolkit for compiling extensions against torch+cu130 ───────────
+# System /usr/local/cuda-12.8 must NOT be used: torch.utils.cpp_extension
+# rejects major/minor mismatch (12.8 vs 13.0). Prefer env nvcc via CUDA_HOME.
+cuda-version = "==13.0"
+cuda-nvcc = { version = "13.0.*", channel = "nvidia" }
+cuda-cudart-dev = { version = "13.0.*", channel = "nvidia" }
+cuda-cccl = { version = "13.0.*", channel = "nvidia" }
+
+# ── ROS 2 Jazzy baseline ─────────────────────────────────────────────────────
+ros-jazzy-desktop = "*"
+ros-jazzy-cv-bridge = "*"
+ros-jazzy-vision-opencv = "*"
+ros-jazzy-rosbridge-server = "*"
+ros-jazzy-tf2-ros = "*"
+
+# ── Workspace tooling ────────────────────────────────────────────────────────
+colcon-common-extensions = "*"
+# Robostack launch_testing is incompatible with pytest>=9 (same pin as
+# physical_ai_runtime).
+pytest = ">=8,<9"
+
+# ── Native build toolchain (mycpp / nvdiffrast / pytorch3d) ───────────────────
+cmake = "*"
+ninja = "*"
+c-compiler = "*"
+cxx-compiler = "*"
+pkg-config = "*"
+sysroot_linux-64 = ">=2.39"
+patchelf = "*"
+eigen = "*"
+pybind11 = "*"
+# Tkinter GUI in foundationpose_ros_multi.py
+tk = "*"
+# Boost headers come via robostack (libboost-devel). Do NOT add boost-cpp —
+# it conflicts with ros-jazzy-desktop / pcl-conversions (same as
+# physical_ai_runtime, which leaves boost to the ROS stack).
+
+# ── Sensors (RealSense via robostack, same as physical_ai_runtime) ───────────
+ros-jazzy-realsense2-camera = "*"
+ros-jazzy-realsense2-camera-msgs = "*"
+ros-jazzy-realsense2-description = "*"
+
+# ── Numerics / IO owned by conda (do NOT duplicate on PyPI) ──────────────────
+# numpy + opencv arrive via the ROS / OpenCV stack. Prefer conda for the rest
+# so they stay ABI-aligned with physical_ai_runtime.
+# From requirements.txt: skip numpy / opencv-python-headless / scipy / pandas /
+# pillow — already provided here or via ROS.
+scipy = "*"
+matplotlib = "*"
+pandas = "*"
+pillow = "*"
+h5py = "*"
+scikit-learn = "*"
+imageio = "*"
+imageio-ffmpeg = "*"
+pyarrow = "*"
+cryptography = "*"
+tqdm = "*"
+joblib = "*"
+psutil = "*"
+requests = "*"
+"ruamel.yaml" = "*"
+
+# ── Flask teaching server (requirements.txt) ─────────────────────────────────
+flask = ">=2.3"
+flask-socketio = ">=5.3"
+flask-cors = ">=4.0"
+python-socketio = ">=5.8"
+eventlet = "*"
+
+# ── RealSense Python bindings (standalone capture in nodes/realsense_node.py)
+# ROS camera pkgs above pull librealsense; this adds the pyrealsense2 module.
+pyrealsense2 = "*"
+
+[activation.env]
+WORKSPACE_ROOT = "$PIXI_PROJECT_ROOT"
+RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
+CYCLONEDDS_URI = "file://$PIXI_PROJECT_ROOT/.config/cyclonedds_default.xml"
+ROS_DOMAIN_ID = "0"
+CMAKE_GENERATOR = "Ninja"
+# Prefer the pixi env when CMake looks for Python / Eigen / pybind11.
+CMAKE_PREFIX_PATH = "$CONDA_PREFIX"
+# Match torch 2.13+cu130 (do not inherit /usr/local/cuda-12.8).
+CUDA_HOME = "$CONDA_PREFIX"
+CUDA_PATH = "$CONDA_PREFIX"
+# CUDA headers: toolkit path FIRST (has crt/host_*.h). nvidia/cu13 second
+# (cusparse.h etc.). Putting cu13 first breaks nvdiffrast JIT with:
+#   fatal error: crt/host_config.h: No such file or directory
+CPATH = "$CONDA_PREFIX/targets/x86_64-linux/include:$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cu13/include"
+CPLUS_INCLUDE_PATH = "$CONDA_PREFIX/targets/x86_64-linux/include:$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cu13/include"
+LIBRARY_PATH = "$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cu13/lib:$CONDA_PREFIX/lib"
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib/python3.12/site-packages/torch/lib:$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cu13/lib:$CONDA_PREFIX/lib"
+
+[tasks]
+# Install GPU Python deps + conda solve.
+install = "pixi install"
+
+# ── ROS 2 sim showcase (used with sibling ros-claw/rosclaw .venv via rosbridge) ─
+# Terminal A: pixi run rosbridge
+# Terminal B: pixi run turtlesim   (needs DISPLAY for the GUI window)
+rosbridge = "ros2 launch rosbridge_server rosbridge_websocket_launch.xml"
+turtlesim = "ros2 run turtlesim turtlesim_node"
+showcase-ros = { cmd = "bash -lc 'echo Start rosbridge in one terminal: pixi run rosbridge; echo Start turtlesim GUI: pixi run turtlesim; echo Then from ros-claw/rosclaw .venv: rosclaw ros ping --endpoint ws://127.0.0.1:9090'" }
+
+
+# ── GPU feature (default) — same PyTorch / CUDA index as physical_ai_runtime ─
+#
+# Intentionally omitted as pypi (already provided by conda):
+#   numpy, opencv-python*, scipy, pyyaml, matplotlib, pandas, pillow, ...
+# Do not add numpy / opencv-python / opencv-python-headless here.
+
+[feature.gpu.pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://pypi.nvidia.com", "https://download.pytorch.org/whl/cu130"]
+index-strategy = "unsafe-best-match"
+
+[feature.gpu.pypi-dependencies]
+# Match physical_ai_runtime: torch>=2.9 from the cu130 index (lock resolves ~2.13+cu130).
+torch = { version = ">=2.9", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+
+[environments]
+default = { features = ["gpu"], solve-group = "runtime" }

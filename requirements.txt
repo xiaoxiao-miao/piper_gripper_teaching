@@ -1,15 +1,21 @@
+# Managed by pixi.toml — prefer: pixi install / pixi shell
+# Kept as a human-readable checklist of app-level Python deps.
+#
+# Conda (pixi [dependencies]):
 flask>=2.3
 flask-socketio>=5.3
 flask-cors>=4.0
 python-socketio>=5.8
 eventlet
-opencv-python-headless
-numpy
-scipy
-pandas
 pyarrow
 imageio-ffmpeg
-pillow
 cryptography
 pyrealsense2
-numpy<2.0  # PySpin(Spinnaker SDK) native extension은 numpy 1.x ABI로 빌드됨
+#
+# Already provided by ROS / conda stack — do NOT pip-install:
+#   opencv-python-headless  → py-opencv / libopencv
+#   numpy                   → conda numpy (via ROS stack)
+#   scipy, pandas, pillow   → conda
+#
+# Upstream (non-pixi) pin: numpy<2.0
+#   PySpin(Spinnaker SDK) native extension은 numpy 1.x ABI로 빌드됨

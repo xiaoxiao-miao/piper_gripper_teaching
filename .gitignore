@@ -23,9 +23,54 @@ frontend/.cache/
 *.crt
 .env
 
+# Pixi / conda environments
+.pixi/
+.conda/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Frontend source maps (compiled output)
+*.js.map
+
 # Dataset (large binary data — managed separately)
 /dataset/
 /exported/
+/data/
+/datasets/
+/screenshots/
+*.bag
+*.db3
+*.mcap
+*.h5
+*.hdf5
+*.npz
+*.parquet
+
+# Model checkpoints / weights
+checkpoints/
+checkpoint/
+ckpt/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+
+# Experiment / output results
+outputs/
+output/
+results/
+runs/
+wandb/
+lightning_logs/
+tmp/
 
 # Editor / OS
 .DS_Store
